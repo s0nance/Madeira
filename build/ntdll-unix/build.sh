@@ -14,6 +14,9 @@ mkdir -p "$OBJ_DIR"
 SUCCEEDED=0
 FAILED=0
 FAILED_FILES=""
+# Every object this run produced. The archive is built from THIS, not from
+# a hand-maintained list and not from obj/*.o -- see the note above `ar`.
+BUILT_OBJS=()
 
 compile_one() {
     local src=$1
@@ -39,6 +42,7 @@ compile_one() {
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
         echo "OK"
         SUCCEEDED=$((SUCCEEDED + 1))
+        BUILT_OBJS+=("$OBJ_DIR/$name.o")
     else
         echo "FAILED"
         FAILED=$((FAILED + 1))
@@ -74,6 +78,7 @@ compile_unixlib() {
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
         echo "OK"
         SUCCEEDED=$((SUCCEEDED + 1))
+        BUILT_OBJS+=("$OBJ_DIR/$name.o")
     else
         echo "FAILED"
         FAILED=$((FAILED + 1))
@@ -153,23 +158,52 @@ done
 
 echo ""
 echo "Results: $SUCCEEDED succeeded, $FAILED failed"
-if [ -n "$FAILED_FILES" ]; then
+# Hard fail. This script used to print the failures and archive anyway,
+# which ships either a stale object from a previous run or none at all --
+# both silent. win32u-unix/build.sh has always done this; ntdll had not.
+if [ $FAILED -gt 0 ]; then
     echo "Failed:$FAILED_FILES"
+    for n in $FAILED_FILES; do echo "  --- $OBJ_DIR/$n.err"; done
+    echo ""
+    echo "(not archiving)"
+    exit 1
 fi
 
 echo ""
 echo "=== Building libntdll_unix.a ==="
-ar rcs "$OBJ_DIR/libntdll_unix.a" \
-    "$OBJ_DIR/audio_null_ios.o" "$OBJ_DIR/nsi_unixlib_ios.o" \
-    "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
-    "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
-    "$OBJ_DIR/dwrite_unixlib.o" \
-    "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
-    "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
-    "$OBJ_DIR/security.o" "$OBJ_DIR/serial.o" "$OBJ_DIR/server.o" \
-    "$OBJ_DIR/signal_arm.o" "$OBJ_DIR/signal_arm64.o" "$OBJ_DIR/signal_i386.o" "$OBJ_DIR/signal_x86_64.o" \
-    "$OBJ_DIR/socket.o" "$OBJ_DIR/sync.o" "$OBJ_DIR/syscall.o" "$OBJ_DIR/system.o" \
-    "$OBJ_DIR/tape.o" "$OBJ_DIR/thread.o" "$OBJ_DIR/virtual.o"
+# Derived from what was just compiled, never hand-maintained. The old
+# explicit list is how #61 happened: the dwrite unixlib compiled fine,
+# printed OK, and was simply absent from the `ar` line -- so every
+# __wine_unix_call from dwrite.dll failed, get_glyph_bbox never ran, every
+# glyph reported an empty bbox, and Steam drew NO TEXT AT ALL with no error
+# anywhere. "Compiled OK" says nothing about shipping.
+# Not obj/*.o either: obj/ is gitignored and survives across runs, so a
+# glob would also pick up objects this file set no longer builds.
+if [ ${#BUILT_OBJS[@]} -eq 0 ]; then
+    echo "ERROR: nothing was compiled"
+    exit 1
+fi
+rm -f "$OBJ_DIR/libntdll_unix.a"
+ar rcs "$OBJ_DIR/libntdll_unix.a" "${BUILT_OBJS[@]}"
+
+# Verify by content, per the project's own rule 6. A member count that
+# disagrees with the object count means the archive dropped something.
+# macOS ar lists its own symbol-table member ("__.SYMDEF SORTED") in
+# `ar t` output, so it must be filtered or every count is off by one.
+MEMBERS=$(ar t "$OBJ_DIR/libntdll_unix.a" | grep -v SYMDEF | wc -l | tr -d ' ')
+if [ "$MEMBERS" != "${#BUILT_OBJS[@]}" ]; then
+    echo "ERROR: archive has $MEMBERS members but ${#BUILT_OBJS[@]} objects were built"
+    exit 1
+fi
+# The #61 regression guard, named explicitly: every unixlib's renamed call
+# table must actually be in the archive.
+for sym in dwrite ws2_32 bcrypt secur32 crypt32; do
+    if ! nm "$OBJ_DIR/libntdll_unix.a" 2>/dev/null | grep -q "_${sym}_unix_call_funcs"; then
+        echo "ERROR: ${sym}_unix_call_funcs absent from the archive"
+        exit 1
+    fi
+done
+echo "  $MEMBERS members, unixlib call tables verified"
 
 echo "Copying to app..."
 cp "$OBJ_DIR/libntdll_unix.a" "$APP_LIB"

@@ -133,6 +133,13 @@ fi
 
 echo ""
 echo "=== Building libwin32u_unix.a ==="
+# rm -f first: `ar rcs` UPDATES an existing archive rather than replacing it,
+# so without this the freetype members merged in by the libtool step below
+# survive into the next run and freetype is merged again. Every rebuild added
+# one more copy -- observed 130 members (46 objects + freetype twice) where
+# there should be 84, with autofit/cff/ftbase/... each appearing twice. The
+# archive's contents depended on how many times the script had been run.
+rm -f "$OBJ_DIR/libwin32u_unix.a"
 ar rcs "$OBJ_DIR/libwin32u_unix.a" "$OBJ_DIR"/*.o
 
 # Merge the static freetype so the app link needs no project changes.
@@ -143,6 +150,20 @@ if [ -f "$FREETYPE_DIR/build/libfreetype.a" ]; then
 else
     echo "WARNING: no libfreetype.a — fonts will be disabled"
 fi
+
+# Verify by content: no member may appear twice, and the freetype merge must
+# have happened (its absence silently disables every font).
+DUPES=$(ar t "$OBJ_DIR/libwin32u_unix.a" | grep -v SYMDEF | sort | uniq -d)
+if [ -n "$DUPES" ]; then
+    echo "ERROR: duplicate archive members:"
+    echo "$DUPES" | head -10
+    exit 1
+fi
+if ! ar t "$OBJ_DIR/libwin32u_unix.a" | grep -q "^ftbase"; then
+    echo "ERROR: freetype objects absent from the archive -- fonts would be dead"
+    exit 1
+fi
+echo "  $(ar t "$OBJ_DIR/libwin32u_unix.a" | grep -v SYMDEF | wc -l | tr -d ' ') members, no duplicates, freetype present"
 
 echo "Copying to app..."
 cp "$OBJ_DIR/libwin32u_unix.a" "$APP_LIB"

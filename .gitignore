@@ -117,6 +117,9 @@ build/x64-tests/asmconf_obj/
 # redistributable terms and only unmodified. Not ours to ship -- obtain them
 # yourself, see tools/fetch-vcruntime.md.
 app/Madeira/x86_64-vcruntime/*.dll
+# ...and the installer they are extracted from, which lands in the repo root
+# when you follow that document.
+VC_redist.x64.exe
 research/remote-metal/host/rmetald
 research/remote-metal/guest/rmtest
 
