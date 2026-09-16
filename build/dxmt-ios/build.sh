@@ -17,13 +17,52 @@ OUT_LIB="$BUILD_DIR/libdxmt_unix.a"
 
 mkdir -p "$OBJ_DIR"
 
-COMMON_FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -fblocks -O2"
+COMMON_FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=17.0 -fblocks -O2"
 INCLUDES="-I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
 INCLUDES_DIRECTX="-I$DXMT_ROOT/include/native/directx -I$DXMT_ROOT/include/native/windows"
 INCLUDES_SHADERS="-I$BUILD_DIR/shader-headers"
 LLVM_INCLUDES="-I$LLVM_BUILD/include -I$LLVM_SRC/include"
 AIRCONV_DEFS="-D_FILE_OFFSET_BITS=64 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS"
 CXX_FLAGS="-std=c++20 -fno-exceptions -fno-rtti"
+
+# airconv links three precompiled Metal shaders into every module it emits
+# (airconv_context.cpp:188 does linkShader(M, air_msad) and friends), and it
+# reaches them as C byte arrays via -I$INCLUDES_SHADERS. Nothing generated
+# them: the directory is gitignored as a build artefact, the README does not
+# mention it, and a clean tree failed with "fatal error: 'air_msad.h' file
+# not found". The recipe is DXMT's own, lifted from research/dxmt/meson.build
+# lines 127-142 (metalir_generator then hexdump_generator) rather than
+# invented -- including --target=air64-apple-macos14.0, which is what upstream
+# uses for these link-time AIR modules.
+#
+# `xxd -n <name>` is what makes the array name match the symbol airconv
+# expects; without it xxd derives the name from the file path.
+gen_shader_headers() {
+    local shader_src="$DXMT_ROOT/src/airconv/shaders"
+    local out="$BUILD_DIR/shader-headers"
+    mkdir -p "$out"
+    echo "=== AIR shader headers ==="
+    local n regen=0
+    for n in air_msad air_samplepos air_tessellation; do
+        if [ -f "$out/$n.h" ] && [ "$out/$n.h" -nt "$shader_src/$n.metal" ]; then
+            printf "  %-40s up to date\n" "$n.h"
+            continue
+        fi
+        regen=1
+        printf "  %-40s " "$n.h"
+        if xcrun -sdk macosx metal -o "$out/$n.air" -c "$shader_src/$n.metal" \
+                -std=metal3.1 --target=air64-apple-macos14.0 2>"$out/$n.err" \
+           && xxd -n "$n" -i "$out/$n.air" "$out/$n.h"; then
+            echo "OK"
+        else
+            echo "FAILED"
+            head -10 "$out/$n.err"
+            echo "  (needs the Metal toolchain: xcodebuild -downloadComponent MetalToolchain)"
+            exit 1
+        fi
+    done
+    [ $regen -eq 0 ] || echo "  regenerated"
+}
 
 SUCCEEDED=0
 FAILED=0
@@ -51,6 +90,9 @@ compile_cxx() {
     fi
 }
 
+gen_shader_headers
+
+echo ""
 echo "=== winemetal unix (Objective-C) ==="
 compile_objc "$DXMT_SRC/winemetal/unix/winemetal_unix.c" winemetal_unix
 compile_objc "$DXMT_SRC/winemetal/unix/cache.c"          cache
@@ -91,5 +133,49 @@ fi
 
 echo ""
 echo "=== Archiving libdxmt_unix.a ==="
+rm -f "$OUT_LIB"
 xcrun -sdk iphoneos ar rcs "$OUT_LIB" "$OBJ_DIR"/*.o
 echo "Built: $OUT_LIB ($(wc -c < "$OUT_LIB" | tr -d ' ') bytes)"
+
+# Combine with the iOS LLVM static libraries and install. This was a manual
+# libtool line in build/dxmt-ios/README.md, which meant the one artefact the
+# Xcode project actually links was produced by a command nobody ran twice the
+# same way. airconv is LLVM IR construction, so the LLVM libraries are not an
+# optional extra -- without them the app link fails on hundreds of llvm::
+# symbols.
+LLVM_IOS="$REPO_ROOT/toolchains/llvm-ios-build"
+COMBINED="$BUILD_DIR/libdxmt_combined.a"
+APP_LIB="$REPO_ROOT/app/Madeira/libdxmt_combined.a"
+if [ ! -d "$LLVM_IOS/lib" ]; then
+    echo ""
+    echo "ERROR: $LLVM_IOS/lib is missing -- run build/llvm-ios/build.sh first."
+    exit 1
+fi
+echo ""
+echo "=== Combining with LLVM iOS ==="
+rm -f "$COMBINED"
+# "has no symbols" is expected for a handful of LLVM members and is not an error.
+xcrun -sdk iphoneos libtool -static -o "$COMBINED" \
+    "$OBJ_DIR"/*.o "$LLVM_IOS"/lib/*.a 2>&1 | grep -vE "has no symbols" || true
+[ -f "$COMBINED" ] || { echo "ERROR: libtool produced nothing"; exit 1; }
+
+# Verify by content rather than by exit status: one member per DXMT object
+# plus the LLVM ones, and the deployment target must match the app's floor --
+# a mismatch is one linker warning per member (654 of them when LLVM was
+# built at 18.0 against an app at 17.0).
+MEMBERS=$(ar t "$COMBINED" | grep -v SYMDEF | wc -l | tr -d ' ')
+for o in winemetal_unix.o airconv_context.o metallib_writer.o; do
+    ar t "$COMBINED" | grep -qx "$o" || {
+        echo "ERROR: $o absent from the combined archive"; exit 1; }
+done
+PROBE="$BUILD_DIR/.probe"
+rm -rf "$PROBE" && mkdir -p "$PROBE"
+(cd "$PROBE" && ar x "$COMBINED" winemetal_unix.o)
+PLATFORM=$(vtool -show-build "$PROBE/winemetal_unix.o" 2>/dev/null | awk '/platform/ {print $2}')
+MINOS=$(vtool -show-build "$PROBE/winemetal_unix.o" 2>/dev/null | awk '/minos/ {print $2}')
+rm -rf "$PROBE"
+[ "$PLATFORM" = "IOS" ] || { echo "ERROR: platform '$PLATFORM', expected IOS"; exit 1; }
+echo "  $MEMBERS members, platform IOS, minos $MINOS"
+
+cp "$COMBINED" "$APP_LIB"
+echo "Installed: $APP_LIB ($(wc -c < "$APP_LIB" | tr -d ' ') bytes)"
