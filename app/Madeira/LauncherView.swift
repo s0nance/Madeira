@@ -51,6 +51,22 @@ struct LaunchTarget: Identifiable, Hashable {
     /// whole point of the project, and a list that hid it would be useless.
     let machine: String
     let isConsole: Bool
+    /// ml807: whether this can run here at all, decided from the machine word.
+    ///
+    /// A 32-bit image cannot: wow64 needs the guest in the low 2GB and iOS
+    /// hands out no address space below 4GB, so there is no device, prefix or
+    /// setting that makes one work. ntdll refuses it in NtCreateUserProcess
+    /// (ml805) and the refusal is correct, but the dialog explorer then puts up
+    /// says "Invalid handle" -- explorer and shell32 are prebuilt PE binaries
+    /// here, so that string is not reachable without rebuilding them for two
+    /// architectures. The useful place to say it is before Wine is involved at
+    /// all, in the one list the user actually reads.
+    var runnable: Bool { machine != "x86" && machine != "arm32" }
+    /// Why not, in the row's own words.
+    var unrunnableReason: String {
+        machine == "x86" ? "32-bit — iOS has no address space below 4GB"
+                         : "32-bit ARM — not an architecture this can emulate"
+    }
 }
 
 /// Reads the PE header far enough to name the architecture and subsystem.
@@ -235,6 +251,12 @@ struct LauncherView: View {
                                 targetRow(t).contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            // ml807: an entry that cannot run is not tappable.
+                            // Letting it through only reaches ntdll's refusal
+                            // and then a dialog from a prebuilt explorer that
+                            // says "Invalid handle" -- the row already says the
+                            // real reason, so the tap has nothing to add.
+                            .disabled(!t.runnable)
                             Button { choose(t) } label: {
                                 Image(systemName: "slider.horizontal.3")
                                     .foregroundStyle(.secondary)
@@ -278,16 +300,23 @@ struct LauncherView: View {
     private func targetRow(_ t: LaunchTarget) -> some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(t.label).font(.subheadline).foregroundStyle(.primary)
-                Text(t.detail.isEmpty ? t.origin.rawValue : t.detail)
-                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+                Text(t.label).font(.subheadline)
+                    .foregroundStyle(t.runnable ? .primary : .secondary)
+                // ml807: the reason replaces the path for an entry that cannot
+                // run. The path is only useful to someone about to launch it.
+                Text(t.runnable ? (t.detail.isEmpty ? t.origin.rawValue : t.detail)
+                                : t.unrunnableReason)
+                    .font(.caption2)
+                    .foregroundStyle(t.runnable ? Color.secondary : Color.orange)
+                    .lineLimit(1).truncationMode(.head)
             }
             Spacer()
             Text(t.machine)
                 .font(.caption2.monospaced())
                 .padding(.horizontal, 6).padding(.vertical, 2)
-                .background(Capsule().fill(t.machine == "x86-64" ? Color.orange.opacity(0.25)
-                                                                 : Color.secondary.opacity(0.15)))
+                .background(Capsule().fill(!t.runnable ? Color.orange.opacity(0.18)
+                                                       : t.machine == "x86-64" ? Color.orange.opacity(0.25)
+                                                                               : Color.secondary.opacity(0.15)))
             if t.isConsole {
                 Image(systemName: "text.alignleft").font(.caption2).foregroundStyle(.secondary)
             }
