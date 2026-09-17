@@ -2544,8 +2544,35 @@ size_t server_init_process(void)
              * one's identity. */
             {
                 extern void ios_fd_cache_discard( void *peb );
+                extern void ios_teb_list_census( const char *when );
+
                 ios_fd_cache_discard( teb->Peb );
+                /* ml790: and the TEB list, which the boundary leaves cyclic.
+                 * Only on the inherited path -- session one's list is correct
+                 * and must not be touched. */
+                {
+                    extern void ios_teb_list_reset_to_current( void );
+                    ios_teb_list_reset_to_current();
+                }
             }
+        }
+        /* ml789: census on EVERY session, not only on the ones that inherit a
+         * stale ClientId.
+         *
+         * The first cut sat inside that branch, so it only ever ran from
+         * session two onward -- and it came back saturated both times:
+         *
+         *   [teb-list] ml788 session-start: 4097 entries  <-- CAP REACHED
+         *
+         * Saturated on the first measurement cannot distinguish "the session
+         * boundary makes the list cyclic" from "it was cyclic all along and
+         * nothing ever walked it to the end". Those are very different bugs:
+         * the second would mean any guest calling TlsFree can hang the app,
+         * session one included, and Doom was simply the first program here to
+         * do it. Measuring session one settles it, and costs one walk. */
+        {
+            extern void ios_teb_list_census( const char *when );
+            ios_teb_list_census( "session-start" );
         }
     }
 #endif

@@ -12933,17 +12933,115 @@ NTSTATUS WINAPI NtSetLdtEntries( ULONG sel1, ULONG entry1_low, ULONG entry1_high
 /***********************************************************************
  *           virtual_clear_tls_index
  */
+#ifdef WINE_IOS
+/* ml788: teb_list must not be walked without a bound.
+ *
+ * Closing a guest window inside the Wine desktop left a thread pinned at ~99%
+ * CPU, in all three rounds of the spin detector, at the same instruction:
+ *
+ *   [wait-chain] ml686 ==== round 2 (t=+1000ms) why=spin-detected threads=18 ====
+ *     RUNNING "" cpu=994 pc=Madeira`virtual_clear_tls_index+0x5c
+ *
+ * That function contains exactly one loop, LIST_FOR_EACH_ENTRY over teb_list,
+ * so a walk that does not terminate means the list is cyclic. It is held under
+ * virtual_mutex, so the spin is not merely wasted CPU: it wedges every thread
+ * that needs that mutex, which is why the relaunch that followed never reached
+ * NtCreateUserProcess at all.
+ *
+ * The cap is both the diagnosis and the cure. 4096 is far beyond any plausible
+ * thread count here -- the same log reports 18 -- and reaching it costs
+ * microseconds instead of the process.
+ *
+ * Why the list would be cyclic is NOT established. The plausible reading is
+ * that TEBs from earlier sessions are never unlinked and the TEB lands at the
+ * same address every session (0x71fffe0000 in every log so far), so a stale
+ * entry re-inserted would link to itself. ios_teb_list_census exists to check
+ * that rather than assume it: if the count grows from one session to the next,
+ * or the walk trips the cap, the guess is confirmed. Until then it is a guess,
+ * and the cap stands on its own merits regardless of which it turns out to be.
+ */
+#define IOS_TEB_WALK_CAP 4096u
+
+/* ml790: rebuild teb_list around the current TEB at a session boundary.
+ *
+ * Measured, and it settles what the saturated counts could not:
+ *
+ *   session 1: [teb-list] ml788 session-start: 1 entry
+ *   session 2: [teb-list] ml788 session-start: 4097 entries  <-- CAP REACHED
+ *
+ * So the cycle is not pre-existing. It is made by the boundary. virtual_alloc_teb
+ * ends with list_add_head( &teb_list, &thread_data->entry ) and the only
+ * list_remove for such an entry is on thread exit, which a session teardown does
+ * not reach -- and the TEB lands at the same address every session
+ * (0x71fffe0000 in every log of this investigation). So session two re-adds an
+ * entry that is still linked into the list, whose next/prev point at itself, and
+ * the walk never terminates. Doom's close was the first thing here to call
+ * TlsFree and therefore the first to walk it to the end; the cap added
+ * alongside this keeps that from being fatal either way.
+ *
+ * Rebuilding rather than unlinking the stale entries one by one: their links
+ * are exactly what is not trustworthy, so following them to clean up is the one
+ * thing that cannot be done safely. Every entry other than the current TEB names
+ * a thread of a session that is gone, so the truthful list at this moment has
+ * exactly one member.
+ */
+void ios_teb_list_reset_to_current( void )
+{
+    TEB *teb = NtCurrentTeb();
+    struct ntdll_thread_data *thread_data;
+    sigset_t sigset;
+
+    if (!teb) return;
+    thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    list_init( &teb_list );
+    list_add_head( &teb_list, &thread_data->entry );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+    dprintf( 2, "[teb-list] ml790 rebuilt around the current TEB (%p); every other "
+                "entry named a thread of a dead session\n", teb );
+}
+
+void ios_teb_list_census( const char *when )
+{
+    struct ntdll_thread_data *td;
+    unsigned n = 0;
+    sigset_t sigset;
+    int cyclic = 0;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    LIST_FOR_EACH_ENTRY( td, &teb_list, struct ntdll_thread_data, entry )
+        if (++n > IOS_TEB_WALK_CAP) { cyclic = 1; break; }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+    dprintf( 2, "[teb-list] ml788 %s: %u entr%s%s\n", when, n, n == 1 ? "y" : "ies",
+             cyclic ? "  <-- CAP REACHED, the list is cyclic" : "" );
+}
+#endif
+
 NTSTATUS virtual_clear_tls_index( ULONG index )
 {
     struct ntdll_thread_data *thread_data;
     sigset_t sigset;
+#ifdef WINE_IOS
+    const ULONG index_in = index;
+    unsigned walked = 0;
+    int capped = 0;
+#endif
 
     if (index < TLS_MINIMUM_AVAILABLE)
     {
         server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+#ifdef WINE_IOS
+        walked = 0;
+#endif
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+#ifdef WINE_IOS
+            if (++walked > IOS_TEB_WALK_CAP) { capped = 1; break; }
+#endif
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
             if (wow_teb) wow_teb->TlsSlots[index] = 0;
@@ -12959,9 +13057,15 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
         if (index >= 8 * sizeof(peb->TlsExpansionBitmapBits)) return STATUS_INVALID_PARAMETER;
 
         server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+#ifdef WINE_IOS
+        walked = 0;
+#endif
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+#ifdef WINE_IOS
+            if (++walked > IOS_TEB_WALK_CAP) { capped = 1; break; }
+#endif
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
             if (wow_teb)
@@ -12975,6 +13079,12 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
         }
         server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     }
+#ifdef WINE_IOS
+    if (capped)
+        dprintf( 2, "[teb-list] ml788 virtual_clear_tls_index(index=%u) walked past %u "
+                    "entries -- teb_list is cyclic; stopped instead of spinning under "
+                    "virtual_mutex\n", (unsigned)index_in, IOS_TEB_WALK_CAP );
+#endif
     return STATUS_SUCCESS;
 }
 
