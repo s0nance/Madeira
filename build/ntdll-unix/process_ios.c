@@ -1334,6 +1334,40 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
         goto done;
     }
+#ifdef WINE_IOS
+    /* ml805: refuse a 32-bit image HERE, in the parent, before anything exists
+     * to wedge.
+     *
+     * Taken from Vuqar05/Madeira#3 (their ml791). WOW64 needs the guest's
+     * process parameters in the low 2 GB and iOS hands out no address space
+     * below 4 GB at all, so the reservation fails on a range with nothing in it
+     * -- not a capacity problem, so no device and no prefix makes it work. The
+     * prefix still advertises i386 in supported_machines because its syswow64
+     * directories exist, which is what lets these spawns get this far.
+     *
+     * The failure mode is the one this tree spent a day on from the other end:
+     * the child died without telling wineserver, so the parent stayed parked on
+     * the startup_info wait forever, and since every window of the desktop
+     * belongs to that one parent thread the whole UI froze with only the
+     * host-drawn cursor still moving. Checking the machine the moment
+     * get_pe_file_info reports it means no child is created, no parent waits,
+     * and CreateProcess fails the way Windows fails it -- ERROR_BAD_EXE_FORMAT,
+     * into the caller's own error path.
+     *
+     * Not an edge case: Inscryption.exe and itch.io's AShortHike.exe both
+     * report Machine=0x14c, and a Start-menu shortcut now makes pointing the
+     * launcher at a stock indie build the obvious next thing to try. */
+    if (!is_machine_64bit( pe_info.machine ))
+    {
+        ERR( "%s is a 32-bit program (machine %04x). iOS has no address space below 4GB, "
+             "so wow64 cannot be set up and it cannot be started; use a 64-bit build.\n",
+             debugstr_us(&path), pe_info.machine );
+        dprintf( 2, "[proc-gate] ml805 REJECTED 32-bit image machine=%04x before spawn\n",
+                 pe_info.machine );
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
+#endif
     if (!machine)
     {
         /* Owner-aware (X3): the SPAWNER's identity decides hybrid-image

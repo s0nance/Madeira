@@ -1733,7 +1733,36 @@ void abort_thread( int status )
  */
 void abort_process( int status )
 {
+#ifdef WINE_IOS
+    /* ml804: _exit() is not available to a pseudo-process.
+     *
+     * Taken from Vuqar05/Madeira#3 (their ml790), which is right and which this
+     * tree still had the bare _exit for. Every Wine "process" here is a thread
+     * in the one Mach task, so _exit() does not end the caller -- it ends the
+     * app, taking the desktop, the service processes and every other running
+     * game with it. NtTerminateProcess routes a self-terminate that has not
+     * already set the exiting flag straight here, which is the normal path for
+     * a child that gives up during startup.
+     *
+     * That became a live hazard rather than a latent one when this session
+     * gained a desktop that hosts children: one child abandoning startup would
+     * have taken everything with it.
+     *
+     * process_exit_wrapper is the pseudo-process equivalent and the teardown
+     * already proven on the exit path: it closes THIS process's master socket
+     * -- how wineserver learns the process died, which is what releases a
+     * parent parked in NtCreateUserProcess -- then its fd cache, its FEX-band
+     * spans and its JIT pool, then exit(), which the wine_ios_exit shim turns
+     * into a longjmp back to this thread's own entry point. */
+    extern void process_exit_wrapper( int status );
+
+    ERR( "abort_process(0x%x): pseudo-process teardown, not _exit rev=ml804\n",
+         (unsigned)status );
+    pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
+    process_exit_wrapper( get_unix_exit_code( status ));
+#else
     _exit( get_unix_exit_code( status ));
+#endif
 }
 
 
