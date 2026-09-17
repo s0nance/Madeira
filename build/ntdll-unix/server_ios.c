@@ -1591,6 +1591,73 @@ static struct ios_fd_cache *ios_get_fd_cache(void)
     return &ios_fd_cache_fallback;
 }
 
+/* ml786: drop a cache at a SESSION boundary, without closing anything.
+ *
+ * A second Wine session runs in the same process and therefore under the same
+ * PEB, so ios_get_fd_cache() hands it the first session's cache -- one
+ * "[fd-cache] new PEB-keyed cache slot=0 peb=0x71ffff0000" line appears in the
+ * log, in session one, and session two silently inherits it. Every entry in it
+ * names an fd that belonged to a process the server has since killed.
+ *
+ * That is what failed the second session's main image, all the way down:
+ *
+ *   [img-hdr] ml785 heap-x64.exe map_pe_header -> 0xc000007b
+ *             (fd=49 st_size=0x0 pe header_size=0x400 -> used 0x0/0x0)
+ *
+ * fstat succeeded, so fd 49 was open -- just not the exe. server_get_unix_fd
+ * found a cached entry from session one, the number had since been recycled,
+ * and a zero-length fstat made header_size 0, which is map_pe_header's single
+ * failure condition.
+ *
+ * Deliberately NOT ios_fd_cache_release(): that one closes, and its own
+ * comment names the hazard -- "a stale cache entry whose fd number was
+ * recycled into another thread's comm pipe". At a session boundary every entry
+ * is stale by definition, so closing them is precisely the wrong move; we
+ * would be closing fds that now belong to somebody else. The fds here were
+ * either already closed by the first session's teardown, in which case there
+ * is nothing to do, or they leak. A handful of leaked descriptors is a much
+ * smaller problem than closing another thread's pipe.
+ */
+void ios_fd_cache_discard( void *peb )
+{
+    int i, n, dropped = 0;
+    struct ios_fd_cache *c = NULL;
+
+    pthread_mutex_lock( &ios_fd_cache_alloc_lock );
+    n = ios_fd_cache_count;
+    for (i = 0; i < n && i < IOS_MAX_FD_CACHES; i++)
+        if (ios_fd_caches[i].in_use && ios_fd_caches[i].peb == peb)
+        {
+            c = ios_fd_caches[i].cache;
+            ios_fd_caches[i].in_use = 0;
+            ios_fd_caches[i].cache = NULL;
+            break;
+        }
+    pthread_mutex_unlock( &ios_fd_cache_alloc_lock );
+    if (!c)
+    {
+        dprintf( 2, "[fd-cache] ml786 nothing to discard for peb=%p\n", peb );
+        return;
+    }
+
+    for (i = 0; i < FD_CACHE_ENTRIES; i++)
+    {
+        union fd_cache_entry *block = c->blocks[i];
+        int j;
+
+        if (!block) continue;
+        for (j = 0; j < FD_CACHE_BLOCK_SIZE; j++)
+            /* ml787: same encoding as the release loop -- fd + 1, and
+             * FD_TYPE_INVALID entries hold an NTSTATUS. Counted, never
+             * closed. */
+            if (block[j].s.fd > 0 && block[j].s.type != FD_TYPE_INVALID) dropped++;
+        if (block != c->initial_block) free( block );
+    }
+    free( c );
+    dprintf( 2, "[fd-cache] ml786 discarded peb=%p, %d stale entry/entries dropped "
+                "WITHOUT closing (they name a dead session's fds)\n", peb, dropped );
+}
+
 /* ml571: drop a dead pseudo-process's cache and close every fd still in it.
  * The thread-local caches had no destructor at all, so each dead thread leaked
  * its cached fds and pinned the unlinked inodes behind them. */
@@ -1617,14 +1684,30 @@ void ios_fd_cache_release( void *peb )
         union fd_cache_entry *block = c->blocks[i];
         if (!block) continue;
         for (j = 0; j < FD_CACHE_BLOCK_SIZE; j++)
-            if (block[j].s.fd > 0)
-            {
-                /* ml586: the prime suspect close — a stale cache entry whose fd
-                 * number was recycled into another thread's comm pipe */
-                ios_fdt_note_close( block[j].s.fd, "fd-cache-release", peb );
-                close( block[j].s.fd );
-                closed++;
-            }
+        {
+            /* ml787: decode before closing, and skip cached failures.
+             *
+             * Taken from willfaust/Madeira#12 (xssp1), which is right and which
+             * this tree ships the bug for. add_fd_to_cache stores fd + 1 so
+             * that zero can mean "unused" (line ~1743), and get_cached_fd
+             * decodes with fd - 1. This loop closed the STORED integer, so it
+             * closed fd + 1 -- the neighbouring descriptor -- and leaked the one
+             * it owned. Worse for FD_TYPE_INVALID entries, where the same field
+             * holds an NTSTATUS rather than a descriptor at all, so the close
+             * hit whatever small integer that status happened to be.
+             *
+             * The ml586 comment right here already suspected a bad close in
+             * this loop and blamed recycling. Recycling was not needed: the
+             * arithmetic alone guarantees the wrong fd every time.
+             */
+            int stored = block[j].s.fd;
+
+            if (stored <= 0) continue;
+            if (block[j].s.type == FD_TYPE_INVALID) continue;   /* an NTSTATUS, not an fd */
+            ios_fdt_note_close( stored - 1, "fd-cache-release", peb );
+            close( stored - 1 );
+            closed++;
+        }
         if (block != c->initial_block) free( block );
     }
     free( c );
@@ -2452,6 +2535,17 @@ size_t server_init_process(void)
                            (unsigned)HandleToULong(teb->ClientId.UniqueThread));
             teb->ClientId.UniqueProcess = 0;
             teb->ClientId.UniqueThread  = 0;
+
+            /* ml786: the same inheritance, one layer down. The fd cache is
+             * keyed by PEB and the PEB is identical across sessions, so this
+             * session would otherwise resolve server handles through the last
+             * session's descriptors. Done here, next to the ClientId, because
+             * it is the same fact: we are a new session wearing the previous
+             * one's identity. */
+            {
+                extern void ios_fd_cache_discard( void *peb );
+                ios_fd_cache_discard( teb->Peb );
+            }
         }
     }
 #endif

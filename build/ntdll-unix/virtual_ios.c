@@ -11296,16 +11296,70 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
     /* map the header */
 
+#ifdef WINE_IOS
+    /* ml785: fstat's result is checked, and the failure says so in dprintf.
+     *
+     * This is the exit that was producing a second session's 0xc000007b, and
+     * the reason nothing announced it: the ERR below is on the `virtual`
+     * channel, which is not enabled -- err:module, err:process, err:seh,
+     * err:server, err:sync and err:thread all appear in the log, err:virtual
+     * never does. Every diagnostic that spoke today is a raw dprintf. There was
+     * no tenth exit from this function; there was an announcement nobody could
+     * hear.
+     *
+     * map_pe_header returns STATUS_INVALID_IMAGE_FORMAT on one condition,
+     * !size, so reaching it means header_size came out 0 -- which given
+     * min(image_info->header_size, st.st_size) means st.st_size is 0, from an
+     * fstat whose return value upstream never checks. */
+    {
+        int fst = fstat( fd, &st );
+
+        if (fst == -1)
+        {
+            dprintf( 2, "[img-stat] ml785 %s fstat(fd=%d) FAILED errno=%d -- st is uninitialised, "
+                        "header_size below is garbage\n", debugstr_us(nt_name), fd, errno );
+            memset( &st, 0, sizeof(st) );
+        }
+    }
+#else
     fstat( fd, &st );
+#endif
     header_size = min( image_info->header_size, st.st_size );
     header_map_size = min( image_info->header_map_size, ROUND_SIZE( 0, st.st_size, host_page_mask ));
     if ((status = map_pe_header( view->base, header_size, header_map_size, fd, &removable )))
     {
+#ifdef WINE_IOS
+        dprintf( 2, "[img-hdr] ml785 %s map_pe_header -> 0x%x (fd=%d st_size=0x%llx "
+                    "pe header_size=0x%x header_map_size=0x%x -> used 0x%x/0x%x)\n",
+                 debugstr_us(nt_name), (unsigned)status, fd,
+                 (unsigned long long)st.st_size,
+                 (unsigned)image_info->header_size, (unsigned)image_info->header_map_size,
+                 (unsigned)header_size, (unsigned)header_map_size );
+#endif
         ERR("[map_image_into_view] map_pe_header FAILED: 0x%x st_size=0x%llx\n", status, (unsigned long long)st.st_size);
         return status;
     }
 
     status = STATUS_INVALID_IMAGE_FORMAT;  /* generic error */
+#ifdef WINE_IOS
+    /* ml784: entry state, printed for EVERY call.
+     *
+     * The failing call and six successful ones in the same session go through
+     * this function; the only way to see what is different about the seventh is
+     * to have the same line for all of them. Paired with the [img-done] line at
+     * the label below, the pair also settles the standing contradiction: nine
+     * IOS_IMG_FAIL sites are unconditional dprintfs and none printed, yet the
+     * only 0xc000007b in the function is the value armed on this line. Either
+     * an exit exists that I have not found by reading it three times, or a
+     * dprintf here does not reach the log. Entry-without-done means the former
+     * and names the range; entry-and-done means the latter. */
+    dprintf( 2, "[img-in] ml784 %s view=%p header_size=0x%x map_size=0x%x flags=0x%x "
+                "machine=0x%x align_mask=0x%x\n",
+             debugstr_us(nt_name), view ? view->base : NULL,
+             (unsigned)header_size, (unsigned)image_info->map_size,
+             (unsigned)image_info->image_flags, image_info->machine,
+             (unsigned)align_mask );
+#endif
     /* ml143 [img-fmt]: steamwebhelper's dbghelp.dll import fails with
      * c000007b AFTER dbghelp already mapped twice in this same run, and the
      * mixed-arch sysx64 fallback is never even attempted for it. This function
@@ -11551,6 +11605,13 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 #endif
 
 done:
+#ifdef WINE_IOS
+    /* ml784: arriving here with the generic value still set is the case no
+     * IOS_IMG_FAIL accounts for. Printed unconditionally, success included, so
+     * that "no line at all" stays meaningful. */
+    dprintf( 2, "[img-done] ml784 %s status=0x%x\n",
+             debugstr_us(nt_name), (unsigned)status );
+#endif
     free( sections );
     return status;
 }
