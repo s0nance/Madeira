@@ -2090,10 +2090,27 @@ struct ContentView: View {
             var poolSizeMB = 896
             if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
                let txt = try? String(contentsOf: d.appendingPathComponent("madeira-pool.txt"), encoding: .utf8),
-               let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
-               mb >= 256, mb <= 1152 {
-                poolSizeMB = mb
-                logStore.log("JIT pool overridden to \(mb)MB via madeira-pool.txt")
+               let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                /* ml774: floor lowered from 256 to 64, and a value outside the
+                 * range now SAYS so instead of being dropped in silence.
+                 *
+                 * I wrote 128 into this file to test the entry-budget theory,
+                 * the clamp discarded it, the default 896 applied, and I read
+                 * the result as if the test had run. A clamp that rejects
+                 * without a word costs more than the typo it guards against --
+                 * especially since ml668 made the VA floor derive from the pool
+                 * actually allocated, which is the hazard the 256 was for.
+                 *
+                 * 64 MB is small enough to matter: the pool costs one VM map
+                 * entry per 16 KB on each alias, so 896 MB is 114,688 entries
+                 * and 64 MB is 8,192. */
+                if mb >= 64 && mb <= 1152 {
+                    poolSizeMB = mb
+                    logStore.log("JIT pool overridden to \(mb)MB via madeira-pool.txt")
+                } else {
+                    logStore.log("madeira-pool.txt says \(mb)MB, outside 64...1152 — " +
+                                 "keeping the \(poolSizeMB)MB default", level: .error)
+                }
             }
             // ml694: W^X A/B switch. Documents/madeira-wx.txt containing "0"
             // disables page demotion for the SAME binary, so the on/off

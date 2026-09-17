@@ -4573,6 +4573,42 @@ static int ios_scan_stop;   /* see ios_scan_stop_name() */
  * address AND its errno, then ask the kernel what actually lives there. */
 static void *ios_scan_fail_addr;
 static int   ios_scan_fail_errno;
+/* ml775: the kern_return_t behind the errno.
+ *
+ * anon_mmap_tryfixed collapses every mach_vm_map failure into two errnos:
+ *
+ *     errno = (ret == KERN_NO_SPACE ? EEXIST : ENOMEM);
+ *
+ * so every "iOS REFUSED A FREE ADDRESS ... errno=12" line in every log this
+ * project has ever produced means only "the kernel said something that was
+ * not KERN_NO_SPACE", and the something was discarded on the spot. That is
+ * the one fact needed to tell a resource shortage (kr=6) from a protection
+ * refusal (kr=2) from an address the task may not have (kr=1), and it has
+ * been thrown away at the point of failure all along.
+ *
+ * Kept as the LAST kr and the FIRST kr separately: a scan makes hundreds of
+ * attempts, and the interesting question is whether they all fail the same
+ * way or the reason changes as the scan climbs. */
+static const char *ios_mach_kr_name( int kr )
+{
+    switch (kr)
+    {
+    case 0:  return "KERN_SUCCESS";
+    case 1:  return "KERN_INVALID_ADDRESS";
+    case 2:  return "KERN_PROTECTION_FAILURE";
+    case 3:  return "KERN_NO_SPACE";
+    case 4:  return "KERN_INVALID_ARGUMENT";
+    case 5:  return "KERN_FAILURE";
+    case 6:  return "KERN_RESOURCE_SHORTAGE";
+    case 8:  return "KERN_NO_ACCESS";
+    case 9:  return "KERN_MEMORY_FAILURE";
+    case 10: return "KERN_MEMORY_ERROR";
+    case 11: return "KERN_ALREADY_IN_SET";
+    default: return "?";
+    }
+}
+static int   ios_last_map_kr;
+static int   ios_scan_fail_kr;
 
 /* Describe what the kernel believes is at addr: the enclosing region, or the
  * hole it falls in. Non-destructive (query only). */
@@ -5202,6 +5238,7 @@ static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
     }
     else
     {
+        ios_last_map_kr = (int)ret;   /* ml775: before it is collapsed away */
         errno = (ret == KERN_NO_SPACE ? EEXIST : ENOMEM);
         ptr = MAP_FAILED;
     }
@@ -6660,7 +6697,7 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
         if (anon_mmap_tryfixed( start, size, unix_prot, 0 ) != MAP_FAILED) return start;
         TRACE( "Found free area is already mapped, start %p.\n", start );
         ios_va_scan_tries++;
-        if (!ios_scan_fail_addr) { ios_scan_fail_addr = start; ios_scan_fail_errno = errno; }
+        if (!ios_scan_fail_addr) { ios_scan_fail_addr = start; ios_scan_fail_errno = errno; ios_scan_fail_kr = ios_last_map_kr; }
 #ifdef WINE_IOS
         /* iOS: mach_vm_map can return KERN_INVALID_ADDRESS (→ ENOMEM) at certain
          * addresses due to ASLR/system mappings.  Keep scanning instead of aborting. */
@@ -6736,6 +6773,8 @@ static void *map_free_area( void *base, void *end, size_t size, int top_down, in
     ios_scan_stop = first ? 0 : 9;
     ios_scan_fail_addr = NULL;
     ios_scan_fail_errno = 0;
+    ios_scan_fail_kr = 0;
+    ios_last_map_kr = 0;
 
     if (top_down)
     {
@@ -9747,14 +9786,16 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                 if (ptr ? ios_storm_gate( &vs_storm ) : (vs_fails++ < 256))
                 dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u skips=%u"
                             " | seen=%p..%p views=%u maxgap=%p stop=%s"
-                            " | firstfail=%p errno=%d(%s) %s%s\n",
+                            " | firstfail=%p errno=%d(%s) kr=%d(%s) lastkr=%d %s%s\n",
                          ptr ? "SLOW" : "FAILED", start, end, (void *)size,
                          (void *)(align_mask + 1), top_down ? "top-down" : "bottom-up",
                          ios_va_scan_tries - tries0, ios_va_scan_skips - skips0,
                          ios_scan_base, ios_scan_end, ios_scan_views,
                          (void *)ios_scan_maxgap, ios_scan_stop_name( ios_scan_stop ),
                          ios_scan_fail_addr, ios_scan_fail_errno,
-                         ios_scan_fail_errno ? strerror( ios_scan_fail_errno ) : "-", what,
+                         ios_scan_fail_errno ? strerror( ios_scan_fail_errno ) : "-",
+                         ios_scan_fail_kr, ios_mach_kr_name( ios_scan_fail_kr ),
+                         ios_last_map_kr, what,
                          ptr ? "" : (ceiling_relaxable ? "  --> relaxing ceiling, retrying unclamped"
                                                        : "  <-- STATUS_NO_MEMORY (callers see a NULL alloc)") );
                 }
@@ -10785,9 +10826,28 @@ static void ios_va_profile( const char *when )
     unsigned i;
 
     if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS)
-        dprintf( 2, "[va-profile] ml749 %s TASK_VM_INFO.max_address=%p (%.1f GB)\n",
-                 when, (void *)(uintptr_t)vmi.max_address,
-                 (double)vmi.max_address / (1024.0*1024.0*1024.0) );
+        /* ml776: min_address printed alongside max, because it was sitting in
+         * the same struct unread while the scan floor was guessed.
+         *
+         * With the real kern_return_t no longer discarded (ml775), the first
+         * failure of every low-band scan is:
+         *
+         *   firstfail=0x100000000 kr=1(KERN_INVALID_ADDRESS) lastkr=3
+         *
+         * INVALID, not NO_SPACE and not a shortage: the kernel is saying the
+         * task may not have that address at all. The later attempts return
+         * KERN_NO_SPACE, so the scan begins below the task's valid range,
+         * spends its budget there, walks into occupied space and gives up.
+         * This line is what makes that checkable rather than inferred --
+         * address_space_start is printed next to it on the following line. */
+        dprintf( 2, "[va-profile] ml749 %s TASK_VM_INFO.min_address=%p max_address=%p (%.1f GB)"
+                    " | address_space_start=%p %s\n",
+                 when, (void *)(uintptr_t)vmi.min_address,
+                 (void *)(uintptr_t)vmi.max_address,
+                 (double)vmi.max_address / (1024.0*1024.0*1024.0),
+                 address_space_start,
+                 ((mach_vm_address_t)(uintptr_t)address_space_start < vmi.min_address)
+                     ? "<-- SCAN FLOOR IS BELOW THE TASK MINIMUM" : "(floor >= minimum)" );
     else
         dprintf( 2, "[va-profile] ml749 %s TASK_VM_INFO UNAVAILABLE\n", when );
 
@@ -11935,6 +11995,62 @@ void virtual_init(void)
                 address_space_start = min( address_space_start, preload_reserve_start );
         }
         unsetenv( "WINEPRELOADRESERVE" );
+    }
+
+    /* ml777: take the scan floor from the kernel instead of a constant.
+     *
+     * Placed AFTER the WINEPRELOADRESERVE block, not before it. The first cut
+     * ran earlier and the preload block undid it on the very next lines:
+     *
+     *     address_space_start = min( address_space_start, preload_reserve_start );
+     *
+     * which took the raised floor straight back down to 0x10000, and because
+     * this is a file static that survives a session, the NEXT session then
+     * started from 0x10000 too. Order is the whole fix here.
+     *
+     * The min() is also wrong to be unconditional: a preload reserve below the
+     * task's minimum names an address the kernel will refuse with
+     * KERN_INVALID_ADDRESS whatever the PE asked for, so the kernel minimum
+     * has to be applied last and win.
+     *
+     * address_space_start was 0x100010000, chosen as "above iOS 4GB
+     * __PAGEZERO". Measured on device, the task's actual minimum is
+     * 0x1020e8000 -- 32 MB higher -- and every fixed mapping attempted below
+     * it is refused with KERN_INVALID_ADDRESS. Not NO_SPACE, not a shortage:
+     * the address is not the task's to have. At 64 KB alignment that is 525
+     * attempts a low-band scan is guaranteed to lose before it reaches
+     * territory the kernel would even consider, and those losses were
+     * indistinguishable from "occupied" until the real kern_return_t stopped
+     * being collapsed into ENOMEM (ml775).
+     *
+     * The minimum is the main image's load address, so ASLR moves it every
+     * launch: no constant can be right here, which is why this reads
+     * TASK_VM_INFO rather than picking a bigger number. Raise only -- if the
+     * kernel ever reports a minimum BELOW the Windows-side floor, the
+     * Windows-side floor is the binding one and must win.
+     */
+    {
+        task_vm_info_data_t vmi;
+        mach_msg_type_number_t vcnt = TASK_VM_INFO_COUNT;
+
+        if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vcnt ) == KERN_SUCCESS &&
+            vmi.min_address > (mach_vm_address_t)(uintptr_t)address_space_start)
+        {
+            void *was = address_space_start;
+            /* Round up to the 64 KB granularity every caller aligns to, so the
+             * first candidate the scan produces is itself valid. */
+            mach_vm_address_t floor = (vmi.min_address + 0xffffULL) & ~0xffffULL;
+
+            address_space_start = (void *)(uintptr_t)floor;
+            dprintf( 2, "[va-floor] ml777 raised address_space_start %p -> %p "
+                        "(TASK_VM_INFO.min_address=%p, %llu KB of guaranteed-invalid "
+                        "scan space removed)\n",
+                     was, address_space_start, (void *)(uintptr_t)vmi.min_address,
+                     (unsigned long long)((uintptr_t)address_space_start - (uintptr_t)was) / 1024 );
+        }
+        else
+            dprintf( 2, "[va-floor] ml777 keeping address_space_start=%p "
+                        "(kernel minimum is not above it)\n", address_space_start );
     }
 
     /* try to find space in a reserved area for the views and pages protection table */

@@ -770,7 +770,29 @@ NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info 
     WORD machine = pe_info->machine;
     ULONGLONG res_start = pe_info->base;
     ULONGLONG res_end = pe_info->base + pe_info->map_size;
-    char preloader_reserve[64], socket_env[64];
+    /* ml778: STATIC, because putenv() keeps the caller's pointer instead of
+     * copying it, and on iOS this function RETURNS.
+     *
+     * Upstream is safe by accident of control flow: exec_wineloader ends in
+     * execv, so the frame never outlives the environment entry. Here there is
+     * no exec -- loader_exec falls through -- so environ was left holding two
+     * pointers into a dead stack frame, and the next Wine session paid for it
+     * in a way that took all day to find:
+     *
+     *   [va-floor] ml777 raised address_space_start 0x10000 -> ...
+     *
+     * 0x10000, in a session whose floor had been 0x100010000. virtual_init
+     * does address_space_start = min(address_space_start, preload_reserve_start)
+     * from WINEPRELOADRESERVE, and this is its only writer in the tree, so the
+     * second session was parsing whatever had since been written over that
+     * frame and clamping its entire address-space floor to the result.
+     *
+     * Static rather than strdup so the storage matches what putenv wants and
+     * nothing has to remember to free it. Two concurrent spawns would now
+     * share these buffers, which is a real if narrow race -- and strictly
+     * better than the guaranteed dangling pointer it replaces. The adjacent
+     * loader_exec already uses `static char noexec[]` for the same reason. */
+    static char preloader_reserve[64], socket_env[64];
 
     if (pe_info->wine_fakedll) res_start = res_end = 0;
     if (pe_info->image_flags & IMAGE_FLAGS_ComPlusNativeReady) machine = native_machine;
