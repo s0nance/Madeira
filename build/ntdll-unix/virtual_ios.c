@@ -11687,6 +11687,9 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
     SIZE_T size = image_info->map_size;
     struct file_view *view;
     unsigned int status;
+#ifdef WINE_IOS
+    int ios_vmi_stage = 0;   /* ml782: see the [img-stage] line at the return */
+#endif
     sigset_t sigset;
 
     if (offset >= size)
@@ -11717,6 +11720,21 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
     status = map_image_view( &view, image_info, size, limit_low, limit_high, alloc_type );
+#ifdef WINE_IOS
+    /* ml782: which step inside this function produced the status.
+     *
+     * ml781 narrowed a second session's 0xc000007b to virtual_map_image, and
+     * then every diagnostic INSIDE it stayed quiet: no [img-map-fail], so
+     * map_image_view succeeded; no [img-fmt], so none of map_image_into_view's
+     * nine reject branches fired; and the server's map_image_view handler
+     * cannot return INVALID_IMAGE_FORMAT at all -- its errors are
+     * INVALID_PARAMETER, IMAGE_NOT_AT_BASE and IMAGE_MACHINE_TYPE_MISMATCH.
+     *
+     * So the status is produced between those, and reading further is how the
+     * day's wrong turns started. One stage counter, printed on a failing
+     * return, costs a build and answers it. */
+    ios_vmi_stage = 1;
+#endif
     /* ml366: NAME the image whose placement failed. ml365's mmdevapi load
      * returned c0000017 with zero attributable evidence — the [va-scan]
      * FAILED line was storm-gated and nothing tied a placement failure to a
@@ -11730,7 +11748,27 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
                  (unsigned long)limit_low, (unsigned long)limit_high );
         goto done;
     }
+#ifdef WINE_IOS
+    /* ml783: split the last two candidates.
+     *
+     * The stage counter said 1, i.e. the status appears between map_image_view
+     * returning and the server call. Two things sit there: map_image_view's own
+     * failure path, whose ERR is capped at 64 and has printed 0 times, and
+     * map_image_into_view. Every failing exit of the latter announces itself
+     * through IOS_IMG_FAIL, and none did -- so one of those two statements is
+     * false, and reading them again is not going to be what settles it.
+     *
+     * dprintf rather than ERR on purpose: the diagnostics that stayed silent on
+     * this path are all ERR(), the ones that spoke are all dprintf, and that
+     * asymmetry is itself worth ruling out. */
+    ios_vmi_stage = 15;
+#endif
     status = map_image_into_view( view, nt_name, unix_fd, image_info, machine, shared_fd, needs_close );
+#ifdef WINE_IOS
+    dprintf( 2, "[img-into] ml783 map_image_into_view -> 0x%x view=%p\n",
+             (unsigned)status, view ? view->base : NULL );
+    ios_vmi_stage = 16;
+#endif
     if (status == STATUS_SUCCESS)
     {
         if (offset)
@@ -11751,9 +11789,15 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
             status = wine_server_call( req );
         }
         SERVER_END_REQ;
+#ifdef WINE_IOS
+        ios_vmi_stage = 2;
+#endif
     }
     if (NT_SUCCESS(status))
     {
+#ifdef WINE_IOS
+        ios_vmi_stage = 3;
+#endif
 #ifdef WINE_IOS
         ERR("iOS virtual_map_image: view=%p is_builtin=%d offset=%ld\n",
             view->base, is_builtin, (long)offset);
@@ -11805,6 +11849,14 @@ done:
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     if (needs_close) close( unix_fd );
     if (shared_needs_close) close( shared_fd );
+#ifdef WINE_IOS
+    if (status && status != STATUS_IMAGE_NOT_AT_BASE)
+        dprintf( 2, "[img-stage] ml782 virtual_map_image -> 0x%x after stage %d "
+                    "(1=map_image_view ok, 2=server map_image_view returned, "
+                    "3=post-success path) view=%p size=%zx\n",
+                 (unsigned)status, ios_vmi_stage,
+                 view ? view->base : NULL, (size_t)size );
+#endif
     return status;
 }
 
@@ -12276,9 +12328,31 @@ NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTIO
 
     if ((status = get_mapping_info( mapping, SECTION_MAP_READ, &sec_flags, &full_size, &shared_file,
                                     &image_info, &nt_name, &exp_name )))
+    {
+#ifdef WINE_IOS
+        /* ml781: say which stage produced the status.
+         *
+         * A second Wine session gets 0xc000007b (STATUS_INVALID_IMAGE_FORMAT)
+         * for the very file the first session mapped, and NEITHER diagnostic
+         * that would explain it fires: no [img-fmt] reject line from
+         * map_image_into_view's seven branches, no "map_pe_header FAILED". So
+         * it comes from a path with no instrumentation, and this function has
+         * three candidates -- get_mapping_info, load_builtin,
+         * virtual_map_image. Guessing which is how five hypotheses died today;
+         * each one names itself here instead. */
+        dprintf( 2, "[map-mod] ml781 get_mapping_info -> 0x%x (machine=0x%x)\n",
+                 (unsigned)status, machine );
+#endif
         return status;
+    }
 
-    if (!image_info) return STATUS_INVALID_PARAMETER;
+    if (!image_info)
+    {
+#ifdef WINE_IOS
+        dprintf( 2, "[map-mod] ml781 mapping carries no pe_image_info -> INVALID_PARAMETER\n" );
+#endif
+        return STATUS_INVALID_PARAMETER;
+    }
 
     *module = NULL;
     *size = 0;
@@ -12286,10 +12360,32 @@ NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTIO
     /* check if we can replace that mapping with the builtin */
     status = load_builtin( image_info, &nt_name, &exp_name, machine, info,
                            module, size, limit_low, limit_high, 0 );
+#ifdef WINE_IOS
+    /* ALREADY_LOADED is the normal "not a builtin, map the file" answer, not a
+     * failure -- reporting it as one is how a diagnostic becomes noise. */
+    if (status && status != STATUS_IMAGE_ALREADY_LOADED)
+        dprintf( 2, "[map-mod] ml781 load_builtin -> 0x%x %s (pe base=0x%llx map_size=0x%llx "
+                    "machine=0x%x, limits 0x%llx..0x%llx)\n",
+                 (unsigned)status, debugstr_us(&nt_name),
+                 (unsigned long long)image_info->base,
+                 (unsigned long long)image_info->map_size,
+                 image_info->machine,
+                 (unsigned long long)limit_low, (unsigned long long)limit_high );
+#endif
     if (status == STATUS_IMAGE_ALREADY_LOADED)
     {
         status = virtual_map_image( mapping, module, size, shared_file, limit_low, limit_high, 0,
                                     machine, image_info, &nt_name, FALSE, 0 );
+#ifdef WINE_IOS
+        if (status && status != STATUS_IMAGE_NOT_AT_BASE)
+            dprintf( 2, "[map-mod] ml781 virtual_map_image -> 0x%x %s (pe base=0x%llx "
+                        "map_size=0x%llx machine=0x%x, limits 0x%llx..0x%llx)\n",
+                     (unsigned)status, debugstr_us(&nt_name),
+                     (unsigned long long)image_info->base,
+                     (unsigned long long)image_info->map_size,
+                     image_info->machine,
+                     (unsigned long long)limit_low, (unsigned long long)limit_high );
+#endif
         virtual_fill_image_information( image_info, info );
     }
     if (shared_file) NtClose( shared_file );
