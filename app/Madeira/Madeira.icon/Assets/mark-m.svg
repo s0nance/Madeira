@@ -5,8 +5,11 @@
        at 50% the letter read as a soft W as much as an M.
        Note for the next editor: XML forbids a double hyphen inside a comment.
        Writing one here made the whole SVG unparseable and the M silently
-       vanished from the render while the frame kept working. -->
-  <path d="M 396 670 L 396 410 L 512 575 L 628 410 L 628 670"
-        fill="none" stroke="#ffffff" stroke-width="50"
+       vanished from the render while the frame kept working.
+       Weight 72: the stems widened with it, so the whole letter grew from 232
+       to 256 across and dropped 14 points, keeping the counters open and the
+       round caps clear of the title bar. -->
+  <path d="M 384 666 L 384 424 L 512 580 L 640 424 L 640 666"
+        fill="none" stroke="#ffffff" stroke-width="72"
         stroke-linejoin="round" stroke-linecap="round"/>
 </svg>
