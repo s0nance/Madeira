@@ -3,13 +3,12 @@
        installed wherever this gets rasterised, and round joins match the
        frame radius. The centre vertex sits 63% of the way down the stems;
        at 50% the letter read as a soft W as much as an M.
+       Re-centred now the title bar is gone: the M had been pushed down to
+       clear it, and with the frame empty it belongs on the frame's own centre.
        Note for the next editor: XML forbids a double hyphen inside a comment.
        Writing one here made the whole SVG unparseable and the M silently
-       vanished from the render while the frame kept working.
-       Weight 72: the stems widened with it, so the whole letter grew from 232
-       to 256 across and dropped 14 points, keeping the counters open and the
-       round caps clear of the title bar. -->
-  <path d="M 384 666 L 384 424 L 512 580 L 640 424 L 640 666"
-        fill="none" stroke="#ffffff" stroke-width="72"
+       vanished from the render while the frame kept working. -->
+  <path d="M 384 640 L 384 384 L 512 550 L 640 384 L 640 640"
+        fill="none" stroke="#ffffff" stroke-width="76"
         stroke-linejoin="round" stroke-linecap="round"/>
 </svg>

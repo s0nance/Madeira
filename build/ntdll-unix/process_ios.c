@@ -1364,6 +1364,23 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
              debugstr_us(&path), pe_info.machine );
         dprintf( 2, "[proc-gate] ml805 REJECTED 32-bit image machine=%04x before spawn\n",
                  pe_info.machine );
+        /* ml806: leave the out-parameters defined.
+         *
+         * The gate works -- the log shows the refusal and the program never
+         * runs -- but the dialog the desktop put up said "Invalid handle"
+         * instead of naming the format. ERROR_INVALID_HANDLE is not something
+         * this status maps to: RtlNtStatusToDosError turns
+         * STATUS_INVALID_IMAGE_FORMAT into ERROR_BAD_EXE_FORMAT. It is what
+         * gets set afterwards by an NtClose on a handle that was never
+         * assigned, which then overwrites the error the caller was about to
+         * report.
+         *
+         * Every error path in this function returns without touching these,
+         * so upstream is relying on callers not to look at them on failure --
+         * an out-parameter left indeterminate is a contract nobody can check.
+         * The fork_and_exec path a few lines up already zeroes them; this does
+         * the same rather than betting on which caller behaves. */
+        *process_handle_ptr = *thread_handle_ptr = 0;
         status = STATUS_INVALID_IMAGE_FORMAT;
         goto done;
     }

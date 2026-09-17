@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <!-- Frame plus a title bar. The bar is what separates "a window" from "a
-       video player": without it, a play mark in a rounded rectangle is the
-       universal media-player icon and says nothing about what Madeira runs.
-       A d-pad was tried instead of the play mark and read as a medical cross. -->
+  <!-- Just the frame. A title bar lived here to argue that the rounded
+       rectangle was a window rather than a video player, which mattered while
+       the mark inside was a play triangle. With a bold M in there the frame is
+       no longer carrying that meaning on its own, so the bar was decoration
+       competing with the letter for the same space. -->
   <rect x="232" y="232" width="560" height="560" rx="104" ry="104"
         fill="none" stroke="#ffffff" stroke-width="58"/>
-  <rect x="316" y="322" width="392" height="38" rx="19" ry="19" fill="#ffffff"/>
 </svg>
