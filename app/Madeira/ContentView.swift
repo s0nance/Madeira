@@ -1237,6 +1237,24 @@ struct ContentView: View {
     /// thing you do repeatedly, and leaving it as the most prominent control
     /// after it has served its purpose is what made the row feel like a lab
     /// bench.
+    /* ml763: what gates a launch is a POOL, not a live debugger.
+     *
+     * The button asked isDebuggerAttached(), i.e. P_TRACED, which goes false
+     * 14 ms into the first run when ml524's early detach fires. For a first
+     * launch that is the right question -- allocating a pool needs the
+     * debugger. For a reuse run it is exactly backwards: the debugger is
+     * guaranteed gone by then, and the pool the first session left behind is
+     * what makes a second one possible. So the control greyed itself out
+     * precisely when the reuse experiment needed it.
+     *
+     * Note this does NOT loosen anything on the normal path: without
+     * madeira-reuse.txt, cachedPool is irrelevant and the answer is the old
+     * one. runWineFullSequence still refuses the second session itself. */
+    private var canLaunch: Bool {
+        if debuggerAttached { return true }
+        return Self.cachedPool != nil && Self.reuseArmed
+    }
+
     private var actionButtons: some View {
         HStack(spacing: 10) {
             if !debuggerAttached {
@@ -1251,7 +1269,7 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.indigo)
-            .disabled(!debuggerAttached)
+            .disabled(!canLaunch)
 
             Spacer(minLength: 0)
 
@@ -1646,7 +1664,7 @@ struct ContentView: View {
                 .tint(.blue)
 
         }
-        .disabled(!debuggerAttached)
+        .disabled(!canLaunch)
     }
 
     private func runTriangleTest() {
@@ -1900,6 +1918,30 @@ struct ContentView: View {
     /// still returns true and cannot stand in for this check.
     private static var wineSessionStarted = false
 
+    /* ml763: the pool survives the session that allocated it.
+     *
+     * Allocating one needs the debugger, and the debugger is gone 14 ms into
+     * the first run (ml524). So a second session cannot make a pool -- but it
+     * does not need to, because the first one's is still mapped, RX and RW
+     * both. Holding the tuple here is what lets a reuse attempt exist at all. */
+    private static var cachedPool: (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? = nil
+
+    /* ml763: Documents/madeira-reuse.txt == "1" arms a SECOND Wine session on
+     * the pool the first one left behind.
+     *
+     * This is an experiment, not a feature, and it is off by default. Nothing
+     * resets Wine's or FEX's state between sessions yet: ntdll's module table,
+     * the server's object tables, the ~49,700 VM regions and FEX's block cache
+     * all still describe the program that just exited. The point of arming it
+     * is to find out WHERE that breaks, which turns an unbounded problem into
+     * a list. Expect it to fail; the value is in how. */
+    private static var reuseArmed: Bool {
+        guard let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+              let txt = try? String(contentsOf: d.appendingPathComponent("madeira-reuse.txt"), encoding: .utf8)
+        else { return false }
+        return txt.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+    }
+
     private func runWineFullSequence() {
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
@@ -1919,7 +1961,11 @@ struct ContentView: View {
          * infinite waits, the pool measured 384/384 MB dirty on BOTH aliases,
          * and the task held ~50,000 VM regions. Reclaiming that needs a
          * wineserver-side teardown, not a flag. */
-        if Self.wineSessionStarted {
+        if Self.wineSessionStarted && Self.reuseArmed && Self.cachedPool != nil {
+            logStore.log("[reuse] ml763 second session armed via madeira-reuse.txt.", level: .info)
+            logStore.log("  Nothing resets Wine or FEX state between sessions yet, so this", level: .info)
+            logStore.log("  is expected to fail. It is armed to find out where.", level: .info)
+        } else if Self.wineSessionStarted {
             logStore.log("A Wine session already ran in this app launch.", level: .error)
             logStore.log("  The JIT pool is granted once, by the debugger, and the debugger", level: .error)
             logStore.log("  is detached straight after. A second pool cannot be obtained.", level: .error)
@@ -2191,13 +2237,28 @@ struct ContentView: View {
                 }
             }
 
-            winios_phase("pool-alloc-begin")
-            logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
-            let t0 = CFAbsoluteTimeGetCurrent()
-            let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
-            let elapsed = CFAbsoluteTimeGetCurrent() - t0
-            winios_phase("pool-ready")
-            logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
+            /* ml763: on a reuse run the pool is already mapped and the debugger
+             * is long gone, so calling allocatePool would re-enter
+             * jit26_prepare_region -> brk #0xf00d with nothing listening: the
+             * unhandled EXC_BREAKPOINT that used to take the app down. Reuse
+             * the tuple instead, and say so loudly. */
+            let pool: (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)?
+            let reusingPool = Self.cachedPool != nil
+            if let existing = Self.cachedPool {
+                pool = existing
+                winios_phase("pool-reused")
+                logStore.log("[reuse] ml763 reusing the pool from the first session " +
+                             "(no debugger, no BRK)", level: .success)
+            } else {
+                winios_phase("pool-alloc-begin")
+                logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
+                let t0 = CFAbsoluteTimeGetCurrent()
+                pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
+                let elapsed = CFAbsoluteTimeGetCurrent() - t0
+                winios_phase("pool-ready")
+                logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
+                Self.cachedPool = pool
+            }
 
             // ml762: remote Metal backend. Documents/madeira-remote.txt holds
             // "<host-ip> <token>" and routes winemetal to a Metal daemon on that
@@ -2296,6 +2357,12 @@ struct ContentView: View {
                 setenv("WINE_IOS_JIT_RX", String(format: "%lx", Int(bitPattern: pool.rx)), 1)
                 setenv("WINE_IOS_JIT_RW", String(format: "%lx", Int(bitPattern: pool.rw)), 1)
                 setenv("WINE_IOS_JIT_SIZE", String(format: "%lx", pool.size), 1)
+                /* ml763: with reuse armed the pool must survive this session --
+                 * handing its pages back (ml760) would leave the next run's
+                 * module tables pointing at zeroes. One variable at a time:
+                 * reclaim OR reuse, never both, until reuse works. */
+                if Self.reuseArmed { setenv("MADEIRA_REUSE", "1", 1) }
+                else               { unsetenv("MADEIRA_REUSE") }
             } else {
                 // ml596: ABORT. "Continuing without it" produced ml595 — a run that
                 // looked like an ARM64EC/optimizer regression but was only Wine
@@ -2312,6 +2379,8 @@ struct ContentView: View {
             }
 
             // Step 1b (ml524, #67): DETACH THE DEBUGGER NOW, while the VM map is small.
+            // ml763: skipped on a reuse run -- the first session already did it,
+            // and there is nothing attached to detach from.
             //
             // Every ~54s whole-app stall coincides with StikDebug DEPARTING — clean
             // exit(0) and jetsam-kill alike (12:07:43 exit(0) -> GAP 54.0s at 12:07:49;
@@ -2339,7 +2408,7 @@ struct ContentView: View {
             // setup, which is AFTER this point, so this BRK still reaches StikDebug.
             // Flip to false to A/B against the old attached-for-the-whole-run behaviour.
             let earlyDetach = true
-            if earlyDetach, pool != nil {
+            if earlyDetach, pool != nil, !reusingPool {
                 let dt0 = CFAbsoluteTimeGetCurrent()
                 StikJITHelper.detachDebugger()
                 let dms = (CFAbsoluteTimeGetCurrent() - dt0) * 1000.0

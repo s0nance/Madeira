@@ -2419,6 +2419,41 @@ size_t server_init_process(void)
 
 #ifdef WINE_IOS
     wine_log_write("[Wine connect] fd_socket=%d, receiving version fd...", fd_socket);
+
+    /* ml766: a second session inherits the FIRST session's TEB, and with it a
+     * thread id that no longer exists.
+     *
+     * server_send_fd tags every fd it passes with data.tid =
+     * GetCurrentThreadId(), read from the TEB. In a genuinely fresh process
+     * that is 0 until init_first_thread's reply arrives, and the server takes
+     * its documented fallback:
+     *
+     *     if (data.tid) thread = get_thread_from_id( data.tid );
+     *     else          thread = get_process_first_thread( process );
+     *
+     * Here the TEB at 0x71fffe0000 is reused, so the tid was still 0x24 -- the
+     * first session's thread, on the first session's dead process. The server
+     * looked it up against the NEW process and refused, twice, before killing
+     * the thread it had just created:
+     *
+     *   [srv-own] receive_fd BAD tid=0024 on pid=0028 client_fd=34 cause=no-thread
+     *   [srv-kill] kill_thread tid=002c pid=0028 violent=1
+     *
+     * Clearing the ClientId restores the fresh-process precondition, which the
+     * server already handles correctly. Unconditional on purpose: on a first
+     * session it is already zero, so this writes what is there. */
+    {
+        TEB *teb = NtCurrentTeb();
+        if (teb && (teb->ClientId.UniqueProcess || teb->ClientId.UniqueThread))
+        {
+            wine_log_write("[Wine connect] ml766 clearing stale ClientId pid=%04x tid=%04x "
+                           "(previous session's)",
+                           (unsigned)HandleToULong(teb->ClientId.UniqueProcess),
+                           (unsigned)HandleToULong(teb->ClientId.UniqueThread));
+            teb->ClientId.UniqueProcess = 0;
+            teb->ClientId.UniqueThread  = 0;
+        }
+    }
 #endif
 
     /* setup the signal mask */

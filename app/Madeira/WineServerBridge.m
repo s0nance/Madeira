@@ -151,6 +151,12 @@ int wineserver_start(const char *prefix_path) {
         madeira_seed_prefix_if_needed(prefix_path);
     }
 
+    /* ml763: clear the stop flag. wineserver_stop() sets it and never resets
+     * it, so a restarted server thread saw "should stop" on its first loop
+     * iteration and exited immediately. Wrong regardless of reuse: a stop flag
+     * that outlives the stop is simply a bug. */
+    g_wineserver_should_stop = 0;
+
     g_wineserver_running = 1;
 
     /* 2026-07-04 perf: the wineserver thread used to be created at LOWERED
@@ -195,4 +201,5 @@ void wineserver_stop(void) {
         wine_log_msg("Wineserver thread joined");
     }
     g_wineserver_running = 0;
+    g_wineserver_thread = 0;
 }

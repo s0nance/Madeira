@@ -5,9 +5,43 @@
 #include "main.c"
 #undef main
 
+/* ml764: the server is initialised ONCE per process, and resumed after that.
+ *
+ * A second Wine session called wineserver_main again, which walked the whole
+ * init sequence a second time and died:
+ *
+ *   [wineserver] init_registry...
+ *   Assertion failed: (root_key), function init_registry, registry.c line 1913
+ *
+ * create_key_object returns NULL there because \REGISTRY already exists --
+ * the first session created it OBJ_PERMANENT and nothing removed it. That is
+ * not an obstacle to route around, it is the server stating a fact: its
+ * object namespace, its registry, its directories and its threading are all
+ * still valid, and re-initialising them is precisely the wrong move.
+ *
+ * main_loop() returns on our own stop flag (fd_ios.c) and leaves every bit of
+ * that state untouched, so a resumed session simply re-enters the loop and
+ * finds the server it left behind. This is also how upstream Wine already
+ * works -- wineserver outlives the processes that talk to it. Here it is a
+ * thread instead of a process, which changes where it lives, not whether it
+ * persists.
+ *
+ * Set before main_loop, not after: main_loop is the part that runs for the
+ * whole session, and a flag set on the far side of it would never be seen.
+ */
+static int ws_initialised = 0;
+
 /* Our replacement that adds logging */
 int wineserver_main(int argc, char *argv[])
 {
+    if (ws_initialised)
+    {
+        ws_log("[wineserver] ml764 already initialised -- re-entering main_loop only");
+        main_loop();
+        ws_log("[wineserver] main_loop returned (resumed session)");
+        return 0;
+    }
+
     ws_log("[wineserver] starting init...");
     setvbuf( stderr, NULL, _IOLBF, 0 );
     server_argv0 = argv[0];
@@ -46,6 +80,7 @@ int wineserver_main(int argc, char *argv[])
     init_threading();
     ws_log("[wineserver] init_registry...");
     init_registry();
+    ws_initialised = 1;
     ws_log("[wineserver] entering main_loop!");
     main_loop();
     ws_log("[wineserver] main_loop returned");

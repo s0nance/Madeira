@@ -527,6 +527,18 @@ static void madeira_reclaim_jit_pool(void)
         return;
     }
 
+    /* ml763: a reuse run needs the pool's contents to stay where they are.
+     * REUSABLE pages come back zero-filled, which is right for a pool that is
+     * about to be re-JITted from nothing and wrong for one whose module tables
+     * are still live. Reclaim or reuse, never both. */
+    if (getenv("MADEIRA_REUSE"))
+    {
+        dprintf(STDERR_FILENO,
+                "[pool-reclaim] ml763 standing down: MADEIRA_REUSE is set, the pool "
+                "must outlive this session\n");
+        return;
+    }
+
     before = madeira_footprint_mb();
     if (rw && (r_rw = madvise(rw, sz, MADV_FREE_REUSABLE)) != 0) e_rw = errno;
     if (rx && (r_rx = madvise(rx, sz, MADV_FREE_REUSABLE)) != 0) e_rx = errno;
