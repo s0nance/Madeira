@@ -22,3 +22,8 @@ int madeira_write_continue_flag(void);
 #ifdef __cplusplus
 }
 #endif
+
+/* ml771: count the task's VM map entries in [4GB,6GB) and attribute them.
+ * Callable at any point so the pool's page-per-entry split can be dated:
+ * present at allocation, or accumulated during the session. */
+void madeira_low_va_census(const char *when, void *rx, void *rw, size_t size);

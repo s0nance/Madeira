@@ -23,6 +23,18 @@
 #include <string.h>
 #include <sys/mman.h>   /* mmap/mprotect: see madeira_pin_wine_stack */
 #include <mach/mach.h>   /* task_info(TASK_VM_INFO): see madeira_reclaim_jit_pool */
+/* <mach/mach_vm.h> is a bare "#error mach_vm.h unsupported." in the iOS SDK,
+ * so declare the one entry point we need, the way virtual_ios.c already
+ * declares vm_protect. (The ntdll side reaches the real API through
+ * build/ntdll-unix/shims/mach/mach_vm.h; the app target has no such include
+ * path, and one extern is less machinery than giving it one.) The types come
+ * from <mach/mach.h> above. */
+extern kern_return_t mach_vm_region_recurse(vm_map_read_t target_task,
+                                            mach_vm_address_t *address,
+                                            mach_vm_size_t *size,
+                                            natural_t *nesting_depth,
+                                            vm_region_recurse_info_t info,
+                                            mach_msg_type_number_t *infoCnt);
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -505,6 +517,160 @@ static unsigned long long madeira_footprint_mb(void)
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) != KERN_SUCCESS)
         return 0;
     return (unsigned long long)vmi.phys_footprint >> 20;
+}
+
+/* ---- ml768: what actually occupies the low VA band between sessions -------
+ *
+ * A second session initialises fully and then cannot place its main module:
+ *
+ *   [va-scan] SLOW window=0x100000000..0x73ffff0000 tries=822 skips=109
+ *             maxgap=0x6f19090000 stop=walked-all-views
+ *             firstfail=0x100000000 errno=12(Cannot allocate memory)
+ *   [main-exe] virtual_map_module = 0xc000007b
+ *   wine: failed to load start.exe: c0000135
+ *
+ * Two readings fit that, and they call for opposite work. Either the low band
+ * really is full of the first session's module copies, in which case the fix
+ * is to release its views at session end; or our own view list is right that a
+ * 476 GB gap exists and the kernel is refusing addresses anyway, which is the
+ * "iOS REFUSED A FREE ADDRESS" behaviour already documented for this device
+ * and a completely different problem.
+ *
+ * maxgap comes from Wine's bookkeeping, not from the kernel, so it cannot
+ * settle it. This asks the kernel directly: every region it admits to holding
+ * between 4 GB and 6 GB, plus the largest hole between them. The JIT pool sits
+ * at 0x120000000..0x150000000 in that band and is expected -- it is the rest
+ * that decides which of the two jobs is the real one.
+ */
+/* ml772: the census must not write to STDERR_FILENO.
+ *
+ * The first cut did, and its at-pool-ready line never appeared: stderr only
+ * becomes madeira-log.txt at the dup2 further down this file, which runs when
+ * Wine launches -- well after the pool is ready. Every byte written before
+ * that goes to the real stderr and is discarded. I had established this
+ * earlier in the very session that added the call, and still walked into it.
+ *
+ * So the census appends to the log file itself. At session end stderr is that
+ * same file opened O_APPEND, so writing it directly is equivalent there, and
+ * it also works at every point where stderr is not the log yet. */
+static void census_emit(const char *line)
+{
+    static char path[1024];
+    static int resolved = 0;
+    int fd;
+
+    if (!resolved)
+    {
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                             NSUserDomainMask, YES).firstObject;
+        if (docs)
+            snprintf(path, sizeof(path), "%s/madeira-log.txt",
+                     [docs fileSystemRepresentation]);
+        resolved = 1;
+    }
+    if (!path[0]) { dprintf(STDERR_FILENO, "%s", line); return; }
+
+    fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) { dprintf(STDERR_FILENO, "%s", line); return; }
+    write(fd, line, strlen(line));
+    close(fd);
+}
+
+static void census_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void census_printf(const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    census_emit(buf);
+}
+
+void madeira_low_va_census(const char *when, void *rx_in, void *rw_in, size_t size_in)
+{
+    const mach_vm_address_t lo = 0x100000000ULL, hi = 0x180000000ULL;
+    mach_vm_address_t addr = lo, prev_end = lo;
+    unsigned long long mapped = 0, maxgap = 0, maxgap_at = 0;
+    int n = 0, onepage = 0, t;
+    /* ml769: by tag, because the first cut printed the first 40 regions and
+     * they covered 26 MB of 1261 -- a listing cannot find the owner of 49,332
+     * entries. Tags are Apple's VM_MEMORY_* namespace (0..255). */
+    static unsigned int tag_n[256];
+    static unsigned long long tag_bytes[256];
+    /* ml770: 49,152 is exactly 768 MB / 16 KB -- the two pool aliases, one VM
+     * entry per page. Measured 49,204 single-page untagged regions, which is
+     * 52 away from that. Compelling is not the same as proven, so count the
+     * regions that actually fall inside the pool rather than inferring it from
+     * a total. */
+    /* ml773: the caller passes the pool explicitly when it knows it. The
+     * globals below live in ntdll-unix and are only set once Wine reads
+     * WINE_IOS_JIT_RX out of the environment, so at pool-ready they are still
+     * NULL -- the first cut printed "rx@0x0 holds 0 regions" and attributed
+     * nothing at exactly the moment attribution mattered. */
+    extern void *ios_jit_rx_base_global;
+    extern void *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    const unsigned long long prx = rx_in ? (unsigned long long)(uintptr_t)rx_in
+                                         : (unsigned long long)(uintptr_t)ios_jit_rx_base_global;
+    const unsigned long long prw = rw_in ? (unsigned long long)(uintptr_t)rw_in
+                                         : (unsigned long long)(uintptr_t)ios_jit_rw_base_global;
+    const unsigned long long psz = size_in ? (unsigned long long)size_in
+                                           : (unsigned long long)ios_jit_pool_size_global;
+    unsigned int in_rx = 0, in_rw = 0;
+
+    memset(tag_n, 0, sizeof(tag_n));
+    memset(tag_bytes, 0, sizeof(tag_bytes));
+
+    while (addr < hi)
+    {
+        mach_vm_size_t sz = 0;
+        vm_region_submap_short_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+        natural_t depth = 0;
+
+        if (mach_vm_region_recurse(mach_task_self(), &addr, &sz, &depth,
+                                   (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS)
+            break;
+        if (addr >= hi) break;
+
+        if (addr > prev_end && (unsigned long long)(addr - prev_end) > maxgap)
+        {
+            maxgap = (unsigned long long)(addr - prev_end);
+            maxgap_at = (unsigned long long)prev_end;
+        }
+        if (psz && addr >= prx && addr < prx + psz) in_rx++;
+        if (psz && addr >= prw && addr < prw + psz) in_rw++;
+        tag_n[info.user_tag & 0xff]++;
+        tag_bytes[info.user_tag & 0xff] += (unsigned long long)sz;
+        if (sz <= 0x4000) onepage++;
+        mapped += (unsigned long long)sz;
+        prev_end = addr + sz;
+        addr = prev_end;
+        n++;
+    }
+    if (hi > prev_end && (unsigned long long)(hi - prev_end) > maxgap)
+    {
+        maxgap = (unsigned long long)(hi - prev_end);
+        maxgap_at = (unsigned long long)prev_end;
+    }
+
+    census_printf(
+            "[low-va] ml769 %s TOTAL: %d regions (%d of them one page), %llu MB mapped, "
+            "largest hole %llu MB at 0x%llx, in [0x%llx,0x%llx)\n",
+            when, n, onepage, mapped >> 20, maxgap >> 20, maxgap_at,
+            (unsigned long long)lo, (unsigned long long)hi);
+    census_printf(
+            "[low-va] ml770 %s   pool: rx@0x%llx holds %u regions, rw@0x%llx holds %u "
+            "(%llu MB each = %llu pages each, %llu for both)\n",
+            when, prx, in_rx, prw, in_rw, psz >> 20,
+            psz / 16384ULL, 2ULL * psz / 16384ULL);
+    for (t = 0; t < 256; t++)
+        if (tag_n[t] >= 100)
+            census_printf(
+                    "[low-va] ml769 %s   tag %3d: %6u regions, %llu MB (avg %llu KB)\n",
+                    when, t, tag_n[t], tag_bytes[t] >> 20,
+                    (tag_bytes[t] / tag_n[t]) >> 10);
 }
 
 static void madeira_reclaim_jit_pool(void)
@@ -1137,6 +1303,11 @@ static void *wine_process_thread(void *arg) {
         /* ml760: the guest is gone and the server is stopped, so the 384 MB
          * pool is dead weight from here on. See madeira_reclaim_jit_pool. */
         madeira_reclaim_jit_pool();
+
+        /* ml768: this is the picture a second session would face. Printed here
+         * rather than at the next launch so it is recorded even when there is
+         * no next launch. */
+        madeira_low_va_census("at-session-end", NULL, NULL, 0);
 
         // Steam S0: this thread's TEB was mirrored into pthread TSD slot
         // 275 (FEX's hardcoded 0x898) which we don't own via

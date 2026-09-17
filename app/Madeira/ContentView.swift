@@ -1976,6 +1976,12 @@ struct ContentView: View {
 
         logStore.log("Running full Wine sequence...")
 
+        /* ml773: the control. If the ~49,000 single-page VM entries are already
+         * here, before any pool exists, then the pool is not their source and
+         * my reading of the at-pool-ready numbers is wrong. Measuring the
+         * baseline costs one walk and settles it either way. */
+        madeira_low_va_census("before-any-pool", nil, nil, 0)
+
         // Start a main thread heartbeat to diagnose hang
         var heartbeatCount = 0
         let heartbeat = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
@@ -2363,6 +2369,12 @@ struct ContentView: View {
                  * reclaim OR reuse, never both, until reuse works. */
                 if Self.reuseArmed { setenv("MADEIRA_REUSE", "1", 1) }
                 else               { unsetenv("MADEIRA_REUSE") }
+                /* ml771: the pool is mapped and nothing has run yet. If the
+                 * page-per-entry split is already here, the allocation made it;
+                 * if it appears later, the per-page protection work did. The two
+                 * call for different fixes, so date it. */
+                madeira_low_va_census(reusingPool ? "at-pool-reused" : "at-pool-ready",
+                                      pool.rx, pool.rw, pool.size)
             } else {
                 // ml596: ABORT. "Continuing without it" produced ml595 — a run that
                 // looked like an ARM64EC/optimizer regression but was only Wine
