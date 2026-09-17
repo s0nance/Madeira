@@ -1339,11 +1339,192 @@ static void ios_bigres_commit( void *addr, size_t size )
  * leak" is the ALLOC vs FREE count for >=16MB band regions. Pairs with the
  * [thr-term] probes in xtajit64 (same rev). */
 static unsigned ios_span_alloc_n, ios_span_free_n;
+
+/* ml801: which pseudo-process each FEX-band span belongs to.
+ *
+ * ml435 above wrote the census to settle one question -- heaps recycling
+ * versus exited threads' spans leaking -- and the run that answers it is in:
+ * 80 ALLOC, 6 FREE, 76 live 16 MB spans after two guest programs, with the
+ * band at fex=231/266 MB where a session of console tests leaves it at 8/18.
+ * It is the leak branch.
+ *
+ * The census records a tid, which cannot drive a reclaim: threads come and go
+ * within a process and the thing that dies is the pseudo-process. So spans are
+ * tagged with the peb here, the same key ios_pool_ledger already uses for the
+ * JIT pool and ios_fd_cache for descriptors.
+ *
+ * Tagging only. Nothing is unmapped yet, and that is deliberate rather than
+ * unfinished: these spans are Wine VIEWS, created through
+ * NtAllocateVirtualMemory and present in views_tree, so releasing them behind
+ * Wine's back would leave its bookkeeping describing memory that is gone --
+ * which is the exact failure, in mirror image, that cost this project a day
+ * when a second session's fresh free_ranges described an address space that
+ * was still mapped. What the release should be needs the number this produces
+ * first: how much of the band a dead child actually owns, and whether it
+ * accounts for the growth.
+ */
+#define IOS_SPAN_TAB_MAX 512
+static struct { void *base; size_t size; void *peb; } ios_span_tab[IOS_SPAN_TAB_MAX];
+static unsigned ios_span_tab_n;
+static unsigned ios_span_tab_overflow;
+static pthread_mutex_t ios_span_tab_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void ios_span_tag( void *base, size_t size, int is_free )
+{
+    extern void *ios_jit_current_peb(void);
+    void *peb = ios_jit_current_peb();
+    unsigned i;
+
+    pthread_mutex_lock( &ios_span_tab_lock );
+    if (is_free)
+    {
+        for (i = 0; i < ios_span_tab_n; i++)
+            if (ios_span_tab[i].base == base)
+            {
+                ios_span_tab[i] = ios_span_tab[--ios_span_tab_n];
+                break;
+            }
+    }
+    else if (ios_span_tab_n < IOS_SPAN_TAB_MAX)
+    {
+        ios_span_tab[ios_span_tab_n].base = base;
+        ios_span_tab[ios_span_tab_n].size = size;
+        ios_span_tab[ios_span_tab_n].peb  = peb;
+        ios_span_tab_n++;
+    }
+    else if (!ios_span_tab_overflow++)
+        dprintf( 2, "[span-own] ml801 table full at %u spans -- further spans are "
+                    "untracked, so the totals below become a lower bound\n",
+                 (unsigned)IOS_SPAN_TAB_MAX );
+    pthread_mutex_unlock( &ios_span_tab_lock );
+}
+
+/* ml802: release a dying pseudo-process's FEX-band spans.
+ *
+ * The ml801 tagging answered the question it was written for, and cleanly:
+ *
+ *   peb=0x10b3a4000 exiting: 38 spans / 640 MB are its own, 0 / 0 MB others
+ *   peb=0x152a4c000 exiting: 38 spans / 640 MB are its own, 38 / 640 MB others
+ *
+ * Each guest owns exactly its own 38 spans and shares none, so the "rpmalloc's
+ * process-wide cache holds them" reading is out -- and the second child sees
+ * the first child's 640 MB still sitting there, which is the growth: about
+ * 640 MB of VA and ~100 MB resident per program run, never given back.
+ *
+ * Released through NtFreeVirtualMemory rather than munmap, because these are
+ * Wine VIEWS and unmapping them behind views_tree would leave the bookkeeping
+ * describing memory that is gone. That is precisely the failure, mirrored,
+ * that cost a day here: a second session started with a free_ranges saying the
+ * whole address space was free while the kernel still held all of it, and its
+ * placement scan then skipped 119 of 119 candidates without calling mmap once.
+ * Wrong bookkeeping is worse than leaked memory, so the release goes through
+ * the path that updates it.
+ *
+ * Called from process_exit_wrapper, on the dying process's OWN thread and
+ * before its server socket is closed: NtCurrentTeb() is still that process's,
+ * which is what makes this a legitimate free rather than a free on behalf of
+ * someone who no longer exists.
+ *
+ * Off unless Documents/madeira-fexreclaim.txt says 1. Releasing 640 MB of a
+ * dying process's views while a desktop session keeps running is worth one
+ * deliberate run before it becomes the default.
+ */
+void ios_fex_reclaim_process( void *peb )
+{
+    size_t mine = 0, others = 0, freed = 0;
+    unsigned n_mine = 0, n_others = 0, n_freed = 0, i;
+    static int armed = -1;
+
+    if (!peb) return;
+    if (armed < 0)
+    {
+        const char *e = getenv( "MADEIRA_FEX_RECLAIM" );
+        armed = (e && e[0] == '1' && e[1] == 0) ? 1 : 0;
+    }
+
+    pthread_mutex_lock( &ios_span_tab_lock );
+    for (i = 0; i < ios_span_tab_n; i++)
+    {
+        if (ios_span_tab[i].peb == peb) { mine += ios_span_tab[i].size; n_mine++; }
+        else                            { others += ios_span_tab[i].size; n_others++; }
+    }
+    pthread_mutex_unlock( &ios_span_tab_lock );
+
+    dprintf( 2, "[span-own] ml801 peb=%p exiting: %u span(s) / %zu MB are its own, "
+                "%u / %zu MB belong to others (%u tracked, %u alloc %u free overall)\n",
+             peb, n_mine, mine >> 20, n_others, others >> 20,
+             ios_span_tab_n, ios_span_alloc_n, ios_span_free_n );
+
+    if (!armed)
+    {
+        dprintf( 2, "[span-own] ml802 not armed (Documents/madeira-fexreclaim.txt != 1) "
+                    "-- %zu MB left in place\n", mine >> 20 );
+        return;
+    }
+
+    /* Snapshot under the lock, free outside it: NtFreeVirtualMemory takes
+     * virtual_mutex and calls back into this file, and holding two locks in one
+     * order here and the other order there is how a teardown deadlocks. */
+    for (;;)
+    {
+        void *base = NULL;
+        SIZE_T size = 0;
+        NTSTATUS st;
+
+        pthread_mutex_lock( &ios_span_tab_lock );
+        for (i = 0; i < ios_span_tab_n; i++)
+            if (ios_span_tab[i].peb == peb)
+            {
+                base = ios_span_tab[i].base;
+                ios_span_tab[i] = ios_span_tab[--ios_span_tab_n];
+                break;
+            }
+        pthread_mutex_unlock( &ios_span_tab_lock );
+        if (!base) break;
+
+        /* MEM_RELEASE with size 0 means "the whole allocation at base", which is
+         * what these spans are -- one view each. */
+        st = NtFreeVirtualMemory( GetCurrentProcess(), &base, &size, MEM_RELEASE );
+        if (st == STATUS_FREE_VM_NOT_AT_BASE)
+        {
+            /* ml803: the census records the address handed to the CALLER, and
+             * some of these come back at view_base + 0x1000 -- measured, seven
+             * of thirty-six per child, every failing one ending in 001000
+             * against successes on a clean boundary. MEM_RELEASE insists on the
+             * base of the allocation, so retry at the 16 MB boundary the band's
+             * spans are aligned to. Recording the view base instead would be
+             * better, but it is not what the allocator returns here, and
+             * inferring it from the one alignment every span in this band
+             * shares is checkable in the log rather than assumed. */
+            void *aligned = (void *)((uintptr_t)base & ~(uintptr_t)0xffffff);
+            void *retry = aligned;
+
+            size = 0;
+            st = NtFreeVirtualMemory( GetCurrentProcess(), &retry, &size, MEM_RELEASE );
+            if (!st)
+                dprintf( 2, "[span-own] ml803 %p was not a base; released %p instead\n",
+                         base, aligned );
+            else
+                dprintf( 2, "[span-own] ml803 %p not a base and %p -> 0x%x\n",
+                         base, aligned, (unsigned)st );
+        }
+        else if (st)
+            dprintf( 2, "[span-own] ml802 release %p -> 0x%x\n", base, (unsigned)st );
+
+        if (!st) { freed += 0x1000000; n_freed++; }
+    }
+
+    dprintf( 2, "[span-own] ml802 released %u span(s) for peb=%p (%zu MB of view), "
+                "%u span(s) still tracked\n",
+             n_freed, peb, freed >> 20, ios_span_tab_n );
+}
+
 static void ios_span_census( void *base, size_t size, int is_free )
 {
     uintptr_t a = (uintptr_t)base;
     unsigned n;
     if (a < 0x7c00000000ULL || a >= 0x8000000000ULL || size < 0x1000000) return;
+    ios_span_tag( base, size, is_free );
     n = is_free ? ++ios_span_free_n : ++ios_span_alloc_n;
     if (n <= 40 || !(n & 15))
         dprintf(2, "[span-census] %s #%u %p+0x%lx tid=%04x live=%d rev=ml435\n",

@@ -2316,6 +2316,12 @@ void process_exit_wrapper( int status )
     {
         extern void ios_jit_reclaim_process( void *peb );
         void *dead_peb = ios_proc_sockets[i].peb;
+        /* ml802: before the socket closes, while this thread is still this
+         * process's. NtFreeVirtualMemory may talk to the server. */
+        {
+            extern void ios_fex_reclaim_process( void *peb );
+            ios_fex_reclaim_process( dead_peb );
+        }
         wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): closing child fd_socket=%d",
                        status, ios_proc_sockets[i].fd);
         ios_fdt_note_close( ios_proc_sockets[i].fd, "exit-master", dead_peb );

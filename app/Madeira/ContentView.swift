@@ -2265,6 +2265,20 @@ struct ContentView: View {
                 logStore.log("W^X override: MADEIRA_WX=\(v) via madeira-wx.txt")
             }
 
+            // ml802: release a dying guest's FEX-band spans. Measured at 640 MB
+            // of view and ~100 MB resident per program run, never given back.
+            // Off by default: it frees a dead process's Wine views while a
+            // desktop session keeps running, which deserves one deliberate run
+            // before it becomes automatic.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-fexreclaim.txt"), encoding: .utf8) {
+                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                setenv("MADEIRA_FEX_RECLAIM", v, 1)
+                logStore.log("FEX band reclaim: MADEIRA_FEX_RECLAIM=\(v) via madeira-fexreclaim.txt")
+            } else {
+                unsetenv("MADEIRA_FEX_RECLAIM")
+            }
+
             // ml758: the JIT-pool dump. It writes the whole RW alias — 384 MiB
             // at the current pool size — into Documents and makes every page of
             // it resident, which showed up as footprint 482 -> 845 MB. Useful
