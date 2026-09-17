@@ -24,6 +24,7 @@
 		A1000020 /* WineServerBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A200001E /* WineServerBridge.m */; };
 		A1000021 /* libwineserver.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000020 /* libwineserver.a */; };
 		A1000022 /* nls in Resources */ = {isa = PBXBuildFile; fileRef = A2000021 /* nls */; };
+		A1000100 /* Madeira.icon in Resources */ = {isa = PBXBuildFile; fileRef = A2000100 /* Madeira.icon */; };
 		A1000030 /* WineProcessBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000030 /* WineProcessBridge.m */; };
 		A1000031 /* libntdll_unix.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000032 /* libntdll_unix.a */; };
 		A1000032 /* aarch64-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000033 /* aarch64-windows */; };
@@ -80,6 +81,7 @@
 		A200001F /* WineServerBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WineServerBridge.h; sourceTree = "<group>"; };
 		A2000020 /* libwineserver.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libwineserver.a; sourceTree = "<group>"; };
 		A2000021 /* nls */ = {isa = PBXFileReference; lastKnownFileType = folder; path = nls; sourceTree = "<group>"; };
+		A2000100 /* Madeira.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = "Madeira.icon"; sourceTree = "<group>"; };
 		A2000030 /* WineProcessBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WineProcessBridge.m; sourceTree = "<group>"; };
 		A2000031 /* WineProcessBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WineProcessBridge.h; sourceTree = "<group>"; };
 		A2000032 /* libntdll_unix.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libntdll_unix.a; sourceTree = "<group>"; };
@@ -177,6 +179,7 @@
 				A2000031 /* WineProcessBridge.h */,
 				A200000A /* EntitlementChecker.swift */,
 				A2000036 /* StikJITHelper.swift */,
+				A2000100 /* Madeira.icon */,
 				A2000021 /* nls */,
 				A2000033 /* aarch64-windows */,
 				A20000F1 /* legal */,
@@ -293,6 +296,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A1000100 /* Madeira.icon in Resources */,
 				A1000022 /* nls in Resources */,
 				A1000032 /* aarch64-windows in Resources */,
 				A10000F1 /* legal in Resources */,
@@ -397,7 +401,7 @@
 		A8000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Madeira;
 				CODE_SIGN_ENTITLEMENTS = Madeira/Madeira.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
@@ -449,7 +453,7 @@
 		A8000004 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Madeira;
 				CODE_SIGN_ENTITLEMENTS = Madeira/Madeira.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;

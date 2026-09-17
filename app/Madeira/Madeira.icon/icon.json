@@ -1,0 +1,86 @@
+{
+  "features": [
+    "refractivity"
+  ],
+  "fill-specializations": [
+    {
+      "value": {
+        "linear-gradient": [
+          "display-p3:0.847,0.196,0.310,1.000",
+          "display-p3:0.216,0.043,0.157,1.000"
+        ],
+        "orientation": {
+          "start": {
+            "x": 0.5,
+            "y": 0.0
+          },
+          "stop": {
+            "x": 0.5,
+            "y": 1.0
+          }
+        }
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "linear-gradient": [
+          "display-p3:0.620,0.118,0.227,1.000",
+          "display-p3:0.106,0.020,0.078,1.000"
+        ],
+        "orientation": {
+          "start": {
+            "x": 0.5,
+            "y": 0.0
+          },
+          "stop": {
+            "x": 0.5,
+            "y": 1.0
+          }
+        }
+      }
+    }
+  ],
+  "groups": [
+    {
+      "blur-material": 0.5,
+      "layers": [
+        {
+          "fill": {
+            "solid": "display-p3:1.000,0.902,0.706,1.000"
+          },
+          "glass": true,
+          "image-name": "window2.svg",
+          "name": "window"
+        },
+        {
+          "fill": {
+            "solid": "display-p3:1.000,0.941,0.831,1.000"
+          },
+          "glass": true,
+          "image-name": "mark-m.svg",
+          "name": "m"
+        }
+      ],
+      "lighting": "individual",
+      "name": "mark",
+      "refractivity": {
+        "depth": 0.6,
+        "enabled": true,
+        "strength": 0.55
+      },
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.45
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 0.3
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

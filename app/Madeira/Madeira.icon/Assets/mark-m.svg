@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Stroked polyline, not a text element: no dependence on a font being
+       installed wherever this gets rasterised, and round joins match the
+       frame radius. The centre vertex sits 63% of the way down the stems;
+       at 50% the letter read as a soft W as much as an M.
+       Note for the next editor: XML forbids a double hyphen inside a comment.
+       Writing one here made the whole SVG unparseable and the M silently
+       vanished from the render while the frame kept working. -->
+  <path d="M 396 670 L 396 410 L 512 575 L 628 410 L 628 670"
+        fill="none" stroke="#ffffff" stroke-width="50"
+        stroke-linejoin="round" stroke-linecap="round"/>
+</svg>
