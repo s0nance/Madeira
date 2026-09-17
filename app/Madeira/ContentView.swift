@@ -851,6 +851,29 @@ struct ContentView: View {
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
+    /// Generic launcher sheet. Replaces the need for one hardcoded Button per
+    /// executable; see LauncherView.swift.
+    @State private var showLauncher = false
+    /// Freeze the console so it can be read. The list is sorted newest-first,
+    /// so any probe that ticks reorders it under your eyes; collapsing the
+    /// periodic gauges cut the volume but not the movement.
+    /// SetupGuideView has existed unreachable since it was written -- nothing
+    /// in this file presented it. It answers exactly the questions this
+    /// session ran into (StikDebug, GetMoreRam, the entitlements), so it
+    /// belongs one tap away.
+    @State private var showSetup = false
+    /// Portrait game-strip height. The surface is a window-level view that
+    /// layoutSubviews re-frames onto this placeholder, so changing the height
+    /// moves the real surface with it -- no overlay tricks needed.
+    ///
+    /// 240pt was the only size, with the log console taking everything below
+    /// it. That split suits reading a trace and not much else: Doom came up in
+    /// a 240pt strip scaled 0.312 and was indistinguishable from a black
+    /// screen until the device was rotated. Landscape remains the way to play;
+    /// this is for the times you need both the picture and the log.
+    @AppStorage("madeira.portrait.gameHeight") private var gameHeight: Double = 240
+    @State private var logFrozen = false
+    @State private var frozenEntries: [LogStore.LogEntry] = []
     @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -891,6 +914,10 @@ struct ContentView: View {
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
             }
+            .sheet(isPresented: $showLauncher) {
+                LauncherView { spec in runLaunchSpec(spec) }
+            }
+            .sheet(isPresented: $showSetup) { SetupGuideView() }
         }
     }
 
@@ -908,16 +935,10 @@ struct ContentView: View {
             // top" of the strip is covered — these rows must be siblings above
             // it, never overlays on it.
             if let ents = entitlements {
-                entitlementBadges(ents)
+                statusStrip(ents)
             }
-            HStack(spacing: 6) {
-                FPSOverlay()
-                Spacer()
-            }
-            .padding(.horizontal, 8)
-            .padding(.bottom, 4)
             MadeiraMetalView()
-                .frame(height: 240)
+                .frame(height: gameHeight)
                 .background(Color.black)
                 .onAppear { TouchControlsHost.attach() }
                 .onReceive(NotificationCenter.default.publisher(
@@ -1076,48 +1097,84 @@ struct ContentView: View {
         }
     }
 
-    private func entitlementBadges(_ ents: EntitlementStatus) -> some View {
-        HStack(spacing: 8) {
-            // Live debugger/JIT state, not the (macOS-only, never granted on
-            // iOS) allow-jit entitlement the old badge checked.
-            entitlementBadge("JIT", granted: debuggerAttached)
-            entitlementBadge("Memory+", granted: ents.increasedMemory)
-            entitlementBadge("64-bit VA", granted: ents.extendedVA)
-            Spacer()
-            // Device model rides in this row (the old standalone statusHeader
-            // row above it spent ~50pt of vertical space on nothing else).
-            VStack(alignment: .trailing, spacing: 0) {
-                Text("Device")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                Text(deviceInfo)
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+    /// One status strip: state, frame rate, and the game-area size control.
+    ///
+    /// This was two rows and looked it -- three heavily tinted pills, then a
+    /// right-aligned two-line "Device / iPhone..." label, then a separate row
+    /// for the frame-rate readout. Three type sizes, two background styles and
+    /// ~50pt of height for information that is mostly static.
+    ///
+    /// The device model moved into the menu: it never changes, so it does not
+    /// deserve permanent screen space. What is left here changes while you
+    /// work, which is the test for belonging.
+    private func statusStrip(_ ents: EntitlementStatus) -> some View {
+        HStack(spacing: 10) {
+            stateDot("JIT", ok: debuggerAttached)
+            stateDot("MEM", ok: ents.increasedMemory)
+            stateDot("VA",  ok: ents.extendedVA)
+
+            Spacer(minLength: 4)
+
+            FPSOverlay(inline: true)
+
+            // Explicit -/+ rather than the cycling button this replaces.
+            // Cycling hid the next state, and at 560pt the control ended up
+            // under the window-level game surface, so the size could be raised
+            // and then not lowered again. A stepper cannot get into that
+            // shape: both directions are always one tap, and the value is
+            // clamped rather than wrapped.
+            //
+            // 44x38 hit areas with contentShape, not the 26x22 icons this
+            // started as: Apple's minimum target is 44pt and these were half
+            // that, on a strip you reach for while a game is running. No
+            // background plate -- the icons carry the affordance, and a grey
+            // rounded rectangle here competed with the actual buttons below.
+            HStack(spacing: 2) {
+                Button {
+                    gameHeight = max(160, gameHeight - 80)
+                } label: {
+                    Image(systemName: "minus")
+                        .frame(width: 44, height: 38)
+                        .contentShape(Rectangle())
+                }
+                .disabled(gameHeight <= 160)
+                Text("\(Int(gameHeight))")
+                    .font(.system(.caption2, design: .monospaced))
+                    .frame(width: 32)
+                    .foregroundStyle(.secondary)
+                Button {
+                    gameHeight = min(640, gameHeight + 80)
+                } label: {
+                    Image(systemName: "plus")
+                        .frame(width: 44, height: 38)
+                        .contentShape(Rectangle())
+                }
+                .disabled(gameHeight >= 640)
             }
+            .font(.body)
+            .buttonStyle(.plain)
+            .accessibilityLabel("Game area height, \(Int(gameHeight)) points")
         }
-        .padding(.horizontal)
-        .padding(.top, 4)
-        .padding(.bottom, 8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 2)
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
             debuggerAttached = isDebuggerAttached()
         }
     }
 
-    private func entitlementBadge(_ label: String, granted: Bool) -> some View {
+    /// A state indicator sized for a status strip: a dot and a short label, no
+    /// tinted capsule. Three filled capsules side by side read as buttons and
+    /// drew the eye away from the controls that are.
+    private func stateDot(_ label: String, ok: Bool) -> some View {
         HStack(spacing: 4) {
-            Image(systemName: granted ? "checkmark.circle.fill" : "xmark.circle")
-                .foregroundColor(granted ? .green : .orange)
-                .font(.caption2)
+            Circle()
+                .fill(ok ? Color.green : Color.orange)
+                .frame(width: 7, height: 7)
             Text(label)
-                .font(.caption2)
-                .foregroundColor(granted ? .primary : .secondary)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(ok ? .primary : .secondary)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(granted ? Color.green.opacity(0.1) : Color.orange.opacity(0.1))
-        )
+        .accessibilityLabel(label + (ok ? " granted" : " missing"))
     }
 
     private func logEntitlementStatus() {
@@ -1131,13 +1188,93 @@ struct ContentView: View {
         }
     }
 
+    /// Apply a LaunchSpec and start Wine.
+    ///
+    /// Deliberately the ONLY place that maps the launcher's choices onto
+    /// MADEIRA_*, so LauncherView cannot drift from how WineProcessBridge
+    /// actually reads them. Note the unsetenv calls: these variables outlive a
+    /// launch inside one app session, so a run that does not want a desktop
+    /// must clear it rather than rely on it being absent -- the hardcoded
+    /// buttons all do this too, and the Steam one is a monument to forgetting.
+    private func runLaunchSpec(_ spec: LaunchSpec) {
+        setenv("MADEIRA_EXE", spec.exe, 1)
+
+        let args = spec.args.trimmingCharacters(in: .whitespaces)
+        if args.isEmpty { unsetenv("MADEIRA_ARGS") } else { setenv("MADEIRA_ARGS", args, 1) }
+
+        if spec.desktop {
+            // explorer.exe is what provides the desktop; a program asked to run
+            // under one is launched as its child, exactly as the Wine Virtual
+            // Desktop button does.
+            setenv("MADEIRA_EXE", "explorer.exe", 1)
+            let inner = args.isEmpty ? spec.exe : "\(spec.exe) \(args)"
+            setenv("MADEIRA_ARGS",
+                   "/desktop=shell,\(spec.width)x\(spec.height) \(inner)", 1)
+            setenv("MADEIRA_DESKTOP", "1", 1)
+            setenv("MADEIRA_SCREEN_W", String(spec.width), 1)
+            setenv("MADEIRA_SCREEN_H", String(spec.height), 1)
+        } else {
+            unsetenv("MADEIRA_DESKTOP")
+        }
+
+        logStore.log("launcher: \(spec.exe)"
+                     + (args.isEmpty ? "" : " args=\(args)")
+                     + (spec.desktop ? " desktop=\(spec.width)x\(spec.height)" : ""))
+        runWineFullSequence()
+    }
+
+    /// Two primary actions and a menu.
+    ///
+    /// This row used to carry seven buttons in a horizontal scroller, each with
+    /// its executable and its experiment's env vars written into the closure --
+    /// Steam Testing alone is ~250 lines of setenv and retracted hypotheses.
+    /// The launcher reaches all of those targets now, and more, so the hardcoded
+    /// ones move into a menu rather than being deleted: the Steam and Stray
+    /// launches encode real knowledge about how those titles have to be
+    /// started, and that is worth keeping even while the games are absent.
+    ///
+    /// Enable JIT disappears once JIT is live. It is a precondition, not a
+    /// thing you do repeatedly, and leaving it as the most prominent control
+    /// after it has served its purpose is what made the row feel like a lab
+    /// bench.
     private var actionButtons: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
-                Button("Enable JIT") {
-                    enableJITViaStikDebug()
+        HStack(spacing: 10) {
+            if !debuggerAttached {
+                Button("Enable JIT") { enableJITViaStikDebug() }
+                    .buttonStyle(.borderedProminent)
+            }
+
+            Button {
+                showLauncher = true
+            } label: {
+                Label("Run a program", systemImage: "play.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.indigo)
+            .disabled(!debuggerAttached)
+
+            Spacer(minLength: 0)
+
+            Menu {
+                Section(deviceInfo) {
+                    Button("Setup guide", systemImage: "questionmark.circle") { showSetup = true }
                 }
-                .buttonStyle(.borderedProminent)
+                Button("Clear log", systemImage: "trash", role: .destructive) { logStore.clear() }
+                Divider()
+                Section("Preset launches") { legacyLaunchButtons }
+            } label: {
+                Image(systemName: "ellipsis.circle").font(.title3)
+            }
+            .disabled(false)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    /// The original hardcoded launches, kept verbatim behind the menu.
+    @ViewBuilder
+    private var legacyLaunchButtons: some View {
+        Group {
 
                 Button("Steam Testing") {
                     // Steam S3 first boot: virtual desktop (Steam needs a
@@ -1508,14 +1645,8 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
 
-                Button("Clear Log") {
-                    logStore.clear()
-                }
-                .buttonStyle(.bordered)
-                .tint(.red)
-            }
-            .padding()
         }
+        .disabled(!debuggerAttached)
     }
 
     private func runTriangleTest() {
@@ -1528,7 +1659,10 @@ struct ContentView: View {
     }
 
     private var logConsole: some View {
-        let entries = logStore.entries.sorted(by: { $0.lastTimestamp > $1.lastTimestamp })
+        // Snapshot on freeze rather than stopping ingestion: lines keep
+        // reaching the file, so nothing is lost while you read.
+        let entries = logFrozen ? frozenEntries
+            : logStore.entries.sorted(by: { $0.lastTimestamp > $1.lastTimestamp })
         return List(entries) { entry in
             HStack(alignment: .top, spacing: 8) {
                 // Timestamp of LAST occurrence
@@ -1560,6 +1694,25 @@ struct ContentView: View {
             .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
         }
         .listStyle(.plain)
+        .overlay(alignment: .topTrailing) {
+            Button {
+                if !logFrozen {
+                    frozenEntries = logStore.entries
+                        .sorted(by: { $0.lastTimestamp > $1.lastTimestamp })
+                }
+                logFrozen.toggle()
+            } label: {
+                Image(systemName: logFrozen ? "play.fill" : "pause.fill")
+                    .font(.caption)
+                    .padding(7)
+                    .background(Circle().fill(logFrozen ? Color.orange.opacity(0.9)
+                                                        : Color.secondary.opacity(0.35)))
+                    .foregroundStyle(logFrozen ? .white : .primary)
+            }
+            .buttonStyle(.plain)
+            .padding(6)
+            .accessibilityLabel(logFrozen ? "Resume the log" : "Freeze the log")
+        }
     }
 
     // ml540: ONE formatter for the whole app, built once on first use.
@@ -1736,11 +1889,44 @@ struct ContentView: View {
     /// Full sequence: allocate JIT pool, start wineserver, start Wine.
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
+    /// One Wine session per app launch. Set on the first run, never cleared.
+    ///
+    /// Not a policy choice -- a consequence of two facts that cannot both be
+    /// worked around here. The pool comes from the debugger via BRK, and the
+    /// debugger is detached right after it is granted (ml524 early-detach,
+    /// the cure for the 54s freeze of #67); after detach no new executable
+    /// mapping can be created, so a second allocatePool() cannot succeed.
+    /// And CS_DEBUGGED PERSISTS after detach, so jit_check_debugged() below
+    /// still returns true and cannot stand in for this check.
+    private static var wineSessionStarted = false
+
     private func runWineFullSequence() {
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
             return
         }
+
+        /* Refuse the second run instead of crashing on it.
+         *
+         * Until this guard existed, launching a second program re-entered
+         * allocatePool() -> jit26_prepare_region() -> brk #0xf00d with no
+         * debugger listening, which is an unhandled EXC_BREAKPOINT and takes
+         * the whole app down -- the same crash, at the same
+         * JITAllocator.c:406, as running under Xcode instead of StikDebug.
+         *
+         * Reusing the existing pool is the real fix and it is not small: after
+         * a guest program exits, four guest threads were still parked on
+         * infinite waits, the pool measured 384/384 MB dirty on BOTH aliases,
+         * and the task held ~50,000 VM regions. Reclaiming that needs a
+         * wineserver-side teardown, not a flag. */
+        if Self.wineSessionStarted {
+            logStore.log("A Wine session already ran in this app launch.", level: .error)
+            logStore.log("  The JIT pool is granted once, by the debugger, and the debugger", level: .error)
+            logStore.log("  is detached straight after. A second pool cannot be obtained.", level: .error)
+            logStore.log("  Force-quit Madeira and relaunch to run another program.", level: .error)
+            return
+        }
+        Self.wineSessionStarted = true
 
         logStore.log("Running full Wine sequence...")
 
