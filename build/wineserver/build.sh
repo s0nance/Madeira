@@ -149,10 +149,20 @@ echo "=== Renaming colliding symbols (objcopy sweep) ==="
 # wineserver still resolve. Externals (win32u, ntdll) only ever see the
 # ws_-prefixed names. Staged in a copy so obj/ keeps un-renamed objects for
 # a selective rebuild.
+# Homebrew's LLVM is keg-only, so llvm-objcopy is not on PATH by default.
+# Look it up at its documented location rather than requiring the caller to
+# export PATH first -- build/wine/build.sh does the same for bison 3, and
+# build-all.sh would otherwise pass its preflight and fail here. NOT a
+# versioned Cellar path: this script used to fall back to
+# /opt/homebrew/Cellar/llvm/22.1.0/bin, which stopped existing the moment
+# Homebrew shipped 23.1.1.
 OBJCOPY=$(command -v llvm-objcopy || true)
+if [ -z "$OBJCOPY" ] && [ -x /opt/homebrew/opt/llvm/bin/llvm-objcopy ]; then
+    OBJCOPY=/opt/homebrew/opt/llvm/bin/llvm-objcopy
+fi
 if [ -z "$OBJCOPY" ]; then
-    echo "ERROR: llvm-objcopy not found. brew install llvm and put"
-    echo "       /opt/homebrew/opt/llvm/bin on PATH."
+    echo "ERROR: llvm-objcopy not found, on PATH or at"
+    echo "       /opt/homebrew/opt/llvm/bin. Run: brew install llvm"
     exit 1
 fi
 COLLISIONS=(

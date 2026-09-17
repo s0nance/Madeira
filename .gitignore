@@ -67,9 +67,10 @@ app/Madeira/aarch64-windows/winedevice.exe
 # Toolchains (pulled by build scripts)
 toolchains/
 
-# Build logs written by the build scripts next to themselves.
-build/*/build.log
-build/*/configure.log
+# Build logs written by the build scripts next to themselves. The suffixed
+# forms are build/llvm-ios/build.sh, which logs each of its two stages.
+build/*/build*.log
+build/*/configure*.log
 
 # Xcode
 *.xcuserdata
