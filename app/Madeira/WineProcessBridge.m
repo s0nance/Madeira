@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <dirent.h>
+#include <pwd.h>          /* getpwuid: runtime profile name, see madeira_repair_profile */
 #include <sys/stat.h>
 #include <limits.h>
 #include <string.h>
@@ -228,6 +229,54 @@ static void madeira_repair_profile(NSString *prefix)
                               @"AppData/Roaming/Microsoft/Windows/Start Menu/Programs" ])
         [fm createDirectoryAtPath:[good stringByAppendingPathComponent:leaf]
       withIntermediateDirectories:YES attributes:nil error:nil];
+
+    /* 2026-09-17: reconcile the TEMPLATE's profile name with the RUNTIME's.
+     *
+     * scripts/build-prefix-snapshot.sh normalises the build host's username to
+     * "madeira" so the template is portable, and rewrites the .reg shell-folder
+     * paths to match. But Wine also derives C:\users\<unix user> for some
+     * lookups, and on iOS that user is "mobile" -- a directory the template
+     * never creates. Observed on device: explorer opening
+     * \??\C:\users\mobile\Desktop and getting STATUS_OBJECT_PATH_NOT_FOUND
+     * (0xc000003a), with users/mobile half-born (Desktop only) next to a
+     * complete users/madeira.
+     *
+     * A symlink satisfies both names at once, which renaming cannot: the
+     * registry keeps pointing at the registered "madeira" path while the
+     * derived path resolves to the same directory. Contents are merge-moved
+     * first, with the same never-clobber helper the ml667 repair uses, so a
+     * half-born profile does not lose data. The runtime name is read from the
+     * password database rather than hardcoded to "mobile" -- if it is already
+     * "madeira" there is nothing to do. */
+    {
+        struct passwd *pw = getpwuid( getuid() );
+        const char *runtime_user = (pw && pw->pw_name && *pw->pw_name) ? pw->pw_name : NULL;
+        if (runtime_user && strcmp( runtime_user, "madeira" ))
+        {
+            NSString *alias = [prefix stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"drive_c/users/%s", runtime_user]];
+            NSDictionary *attrs = [fm attributesOfItemAtPath:alias error:nil];
+            BOOL is_link = [attrs[NSFileType] isEqual:NSFileTypeSymbolicLink];
+            if (attrs && !is_link)
+            {
+                ios_merge_move( alias.fileSystemRepresentation,
+                                good.fileSystemRepresentation, 12 );
+                /* Only remove it once its contents are somewhere else. A file
+                 * collision leaves ios_merge_move's source alive on purpose. */
+                if (![fm contentsOfDirectoryAtPath:alias error:nil].count)
+                    [fm removeItemAtPath:alias error:nil];
+            }
+            if (![fm attributesOfItemAtPath:alias error:nil])
+            {
+                NSError *err = nil;
+                if ([fm createSymbolicLinkAtPath:alias withDestinationPath:@"madeira" error:&err])
+                    LOG( "profile-repair: users/%{public}s -> madeira", runtime_user );
+                else
+                    LOG( "profile-repair: symlink users/%{public}s failed: %{public}s",
+                         runtime_user, err.localizedDescription.UTF8String );
+            }
+        }
+    }
 
     /* ml667: only claim completion once the collapsed tree is actually gone.
      * ios_merge_move refuses to clobber, so a colliding file leaves the source
