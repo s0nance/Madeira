@@ -4155,6 +4155,63 @@ static void *address_space_start = (void *)0x100010000; /* above iOS 4GB __PAGEZ
 #else
 static void *address_space_start = (void *)0x10000;
 #endif
+
+#ifdef WINE_IOS
+/* ml779: the scan floor may never sit below the task's minimum address.
+ *
+ * Three places write address_space_start, and each was wrong here in its own
+ * way:
+ *
+ *   - virtual_init's constant 0x100010000, "above iOS 4GB __PAGEZERO". The
+ *     real minimum is the main image's load address, which ASLR moves every
+ *     launch: measured 3 MB, 32 MB and 70 MB above that constant on three
+ *     consecutive runs, so no constant can be right.
+ *   - the WINEPRELOADRESERVE block, which takes min() with whatever the PE
+ *     asked to reserve -- a request, not a permission.
+ *   - virtual_set_large_address_space, which slams it to 0x10000 AFTER
+ *     virtual_init has finished. Correct upstream, where opening the low 4 GB
+ *     is the entire point of a large-address-space-aware image; 4 GB below the
+ *     floor here.
+ *
+ * Every fixed mapping attempted below the minimum comes back
+ * KERN_INVALID_ADDRESS, which anon_mmap_tryfixed collapsed into ENOMEM until
+ * ml775 kept the real code -- so scans spent their whole budget against an
+ * invisible wall and reported "iOS REFUSED A FREE ADDRESS" for it.
+ *
+ * Patching the writers one at a time is what I tried first, twice, and each
+ * patch only moved the failure to the next writer. So this is a single
+ * chokepoint and an invariant instead of three correct values: nothing
+ * assigns the floor directly any more.
+ *
+ * The minimum is read lazily and cached rather than captured at a chosen
+ * moment. That is the point: the ordering between virtual_init and
+ * virtual_set_large_address_space is precisely what defeated the two earlier
+ * attempts, and a lazy read has no ordering left to get wrong.
+ */
+static void *ios_va_floor_clamp( void *want )
+{
+    static mach_vm_address_t cached_min;
+    static int asked;
+
+    if (!asked)
+    {
+        task_vm_info_data_t vmi;
+        mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+
+        if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS)
+            cached_min = vmi.min_address;
+        asked = 1;
+    }
+    /* Round up to the 64 KB granularity every caller aligns to, so the first
+     * candidate a scan derives from the floor is itself valid. */
+    if (cached_min && (mach_vm_address_t)(uintptr_t)want < cached_min)
+        return (void *)(uintptr_t)((cached_min + 0xffffULL) & ~0xffffULL);
+    return want;
+}
+#define IOS_VA_FLOOR(w) ios_va_floor_clamp( (void *)(w) )
+#else
+#define IOS_VA_FLOOR(w) ((void *)(w))
+#endif
 #ifdef _WIN64
 static void *address_space_limit = (void *)0x7fffffff0000;  /* top of the total available address space */
 static void *user_space_limit    = (void *)0x7fffffff0000;  /* top of the user address space */
@@ -11991,66 +12048,29 @@ void virtual_init(void)
             preload_reserve_start = ROUND_ADDR( start, host_page_mask );
             preload_reserve_end = (void *)ROUND_SIZE( 0, end, host_page_mask );
             /* some apps start inside the DOS area */
+            /* ml779: a reserve the PE asked for is a request, not a grant --
+             * clamp it like every other write to the floor. */
             if (preload_reserve_start)
-                address_space_start = min( address_space_start, preload_reserve_start );
+                address_space_start = IOS_VA_FLOOR( min( address_space_start, preload_reserve_start ) );
         }
         unsetenv( "WINEPRELOADRESERVE" );
     }
 
-    /* ml777: take the scan floor from the kernel instead of a constant.
-     *
-     * Placed AFTER the WINEPRELOADRESERVE block, not before it. The first cut
-     * ran earlier and the preload block undid it on the very next lines:
-     *
-     *     address_space_start = min( address_space_start, preload_reserve_start );
-     *
-     * which took the raised floor straight back down to 0x10000, and because
-     * this is a file static that survives a session, the NEXT session then
-     * started from 0x10000 too. Order is the whole fix here.
-     *
-     * The min() is also wrong to be unconditional: a preload reserve below the
-     * task's minimum names an address the kernel will refuse with
-     * KERN_INVALID_ADDRESS whatever the PE asked for, so the kernel minimum
-     * has to be applied last and win.
-     *
-     * address_space_start was 0x100010000, chosen as "above iOS 4GB
-     * __PAGEZERO". Measured on device, the task's actual minimum is
-     * 0x1020e8000 -- 32 MB higher -- and every fixed mapping attempted below
-     * it is refused with KERN_INVALID_ADDRESS. Not NO_SPACE, not a shortage:
-     * the address is not the task's to have. At 64 KB alignment that is 525
-     * attempts a low-band scan is guaranteed to lose before it reaches
-     * territory the kernel would even consider, and those losses were
-     * indistinguishable from "occupied" until the real kern_return_t stopped
-     * being collapsed into ENOMEM (ml775).
-     *
-     * The minimum is the main image's load address, so ASLR moves it every
-     * launch: no constant can be right here, which is why this reads
-     * TASK_VM_INFO rather than picking a bigger number. Raise only -- if the
-     * kernel ever reports a minimum BELOW the Windows-side floor, the
-     * Windows-side floor is the binding one and must win.
-     */
+    /* ml779: route virtual_init's own floor through the same clamp. Kept as a
+     * log line because the amount ASLR puts between the old constant and the
+     * real minimum is worth seeing in the log of a run that fails. */
     {
-        task_vm_info_data_t vmi;
-        mach_msg_type_number_t vcnt = TASK_VM_INFO_COUNT;
+        void *was = address_space_start;
 
-        if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vcnt ) == KERN_SUCCESS &&
-            vmi.min_address > (mach_vm_address_t)(uintptr_t)address_space_start)
-        {
-            void *was = address_space_start;
-            /* Round up to the 64 KB granularity every caller aligns to, so the
-             * first candidate the scan produces is itself valid. */
-            mach_vm_address_t floor = (vmi.min_address + 0xffffULL) & ~0xffffULL;
-
-            address_space_start = (void *)(uintptr_t)floor;
-            dprintf( 2, "[va-floor] ml777 raised address_space_start %p -> %p "
-                        "(TASK_VM_INFO.min_address=%p, %llu KB of guaranteed-invalid "
-                        "scan space removed)\n",
-                     was, address_space_start, (void *)(uintptr_t)vmi.min_address,
+        address_space_start = IOS_VA_FLOOR( address_space_start );
+        if (address_space_start != was)
+            dprintf( 2, "[va-floor] ml779 raised address_space_start %p -> %p "
+                        "(%llu KB of guaranteed-invalid scan space removed)\n",
+                     was, address_space_start,
                      (unsigned long long)((uintptr_t)address_space_start - (uintptr_t)was) / 1024 );
-        }
         else
-            dprintf( 2, "[va-floor] ml777 keeping address_space_start=%p "
-                        "(kernel minimum is not above it)\n", address_space_start );
+            dprintf( 2, "[va-floor] ml779 address_space_start=%p already at or above "
+                        "the task minimum\n", address_space_start );
     }
 
     /* try to find space in a reserved area for the views and pages protection table */
@@ -13730,7 +13750,11 @@ void virtual_set_large_address_space(void)
     {
         if (!is_wow64())
         {
-            address_space_start = (void *)0x10000;
+            /* ml779: the intent -- open the address space as low as it goes --
+             * is kept; "as low as it goes" is now what the kernel grants this
+             * task rather than the literal 0x10000, which on iOS is 4 GB below
+             * the task minimum and invalid for every mapping. */
+            address_space_start = IOS_VA_FLOOR( 0x10000 );
 #ifndef __APPLE__  /* don't free the zerofill section on macOS */
             if ((main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) &&
                 (main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE))
