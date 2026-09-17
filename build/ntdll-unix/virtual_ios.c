@@ -573,6 +573,10 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
 /* ml668: published by the footprint sampler below and read by its own cadence
  * logic; defined further down alongside ios_jit_pool_size_global. */
 extern unsigned long long ios_last_footprint_mb;
+/* ml791: how long the 250ms warmer period stays armed. Defined here rather
+ * than beside the variable because the warmer, its only reader, comes first in
+ * this file. */
+#define IOS_FAST_FOOTPRINT_SECS 120
 extern int ios_fast_footprint;
 
 static void *ios_pool_warmer_thread( void *arg )
@@ -945,6 +949,17 @@ static void *ios_pool_warmer_thread( void *arg )
         {
             extern unsigned long long ios_last_footprint_mb;
             extern int ios_fast_footprint;
+            extern time_t ios_fast_footprint_since;
+
+            /* ml791: let the fast window close. See ios_fast_footprint_since. */
+            if (ios_fast_footprint && ios_fast_footprint_since &&
+                time( NULL ) - ios_fast_footprint_since > IOS_FAST_FOOTPRINT_SECS)
+            {
+                ios_fast_footprint = 0;
+                dprintf( 2, "[pool-warmer] ml791 fast footprint mode expired after %d s "
+                            "-- back to the 2s period (cycle=%u)\n",
+                         IOS_FAST_FOOTPRINT_SECS, cycle );
+            }
             usleep( (ios_fast_footprint || ios_last_footprint_mb >= 2400) ? 250000 : 2000000 );
         }
     }
@@ -2311,6 +2326,23 @@ void *ios_jit_rw_base_global = NULL;
 size_t ios_jit_pool_size_global = 0;
 unsigned long long ios_last_footprint_mb = 0;   /* ml668: latest phys_footprint MB (decl above) */
 int ios_fast_footprint = 0;                    /* ml670: set when d3d11 loads */
+/* ml791: when it was armed, so it can stop being armed.
+ *
+ * ml670 switched the pool warmer from a 2s to a 250ms period the moment a
+ * module named d3d11 lands in the pool, to catch a texture-upload burst that a
+ * 2s sample kept missing. It was never unset. Measured after one Doom session
+ * inside the Wine desktop: cycle=4732 in 1380 s, so 3.4 Hz rather than 0.5,
+ * each cycle reading 23,328 pages across both pool aliases -- about 373 MB
+ * touched per cycle, so roughly 1.5 GB/s of memory traffic, indefinitely.
+ * madeira-log.txt reached 6.9 MB in 23 minutes and phys_footprint showed
+ * compressed=365 MB, the compressor and the warmer pulling on the same pages.
+ *
+ * A diagnostic that latches on for the life of the process is the defect here,
+ * whoever arms it, so the window is time-boxed rather than made conditional on
+ * something else. 120 s is far longer than the burst it exists to sample. The
+ * >= 2400 MB arm next to it is level-based and clears itself, so it is left
+ * alone. */
+time_t ios_fast_footprint_since = 0;
 
 /* TEB restore trampoline in JIT pool.
  * iOS sigreturn does NOT restore x18 from the ucontext — it always zeroes
@@ -8376,8 +8408,15 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
              * switch on the phase instead of on a level. */
             {
                 const char *mn = ios_pe_module_name( image_base, image_size );
-                if (mn && (strstr(mn, "d3d11") || strstr(mn, "D3D11")))
+                if (mn && (strstr(mn, "d3d11") || strstr(mn, "D3D11")) && !ios_fast_footprint)
+                {
+                    extern time_t ios_fast_footprint_since;
                     ios_fast_footprint = 1;
+                    ios_fast_footprint_since = time( NULL );
+                    dprintf( 2, "[pool-warmer] ml791 fast footprint mode ARMED by %s "
+                                "(250ms period for the next %d s)\n",
+                             mn, IOS_FAST_FOOTPRINT_SECS );
+                }
             }
             dprintf(2, "[jit-pool] image %p+0x%lx (%s) → pool %p used=0x%lx/0x%lx tramp+0x%lx\n",
                     image_base, (unsigned long)image_size,

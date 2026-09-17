@@ -520,6 +520,26 @@ void winios_post_key(int vk, int down) {
     winios_q_push_ev(WINIOS_EV_KEY, vk, 0, down ? 0 : KEYEVENTF_KEYUP, 0);
 }
 
+/* ml792: a stop request has to be executed ON a Wine thread.
+ *
+ * winios_drv_request_quit walks win32u internals (NtUserBuildHwndList,
+ * get_window_long, NtUserPostMessage), all of which need a valid TEB. Calling
+ * it from the app's main thread, where there is none, would be a fault rather
+ * than a stop. The window-tree dump already had this problem and solved it the
+ * same way -- "Runs on this wine thread (valid TEB)" -- so the flag is set from
+ * wherever, and drained here.
+ *
+ * volatile and a plain int: one writer, one reader, and the only thing that
+ * matters is that the read eventually sees the write. */
+static volatile int g_winios_quit_requested;
+
+void winios_request_quit_async(void) {
+    g_winios_quit_requested = 1;
+    fprintf(stderr, "[winios-quit] ml792 stop requested; will be posted from the "
+                    "next pProcessEvents on a Wine thread\n");
+    fflush(stderr);
+}
+
 BOOL winios_pProcessEvents(DWORD mask) {
     static unsigned int cnt;
     static int quiet = -1;
@@ -537,8 +557,19 @@ BOOL winios_pProcessEvents(DWORD mask) {
         if (now >= next_tree_dump) {
             next_tree_dump = now + 5.0;
             winios_dump_window_tree();
+            /* ml795: same cadence, same thread, same enumeration cost. */
+            extern void winios_drv_reap_layers(void);
+            winios_drv_reap_layers();
         }
     }
+    /* ml792: drain a pending stop request. Here rather than anywhere else for
+     * the TEB, see winios_request_quit_async. */
+    if (g_winios_quit_requested) {
+        extern unsigned winios_drv_request_quit(void);
+        g_winios_quit_requested = 0;
+        winios_drv_request_quit();
+    }
+
     BOOL drained = FALSE;
     for (;;) {
         winios_input_event_t e;
@@ -712,6 +743,47 @@ static CALayer *winios_layer_for(HWND hwnd, bool create) {
         fflush(stderr);
     }
     return l;
+}
+
+/* ml795: drop layers whose window is gone.
+ *
+ * A layer is created lazily on a window's first present and removed only by
+ * winios_pDestroyWindow -- which win32u never calls here: measured across a
+ * full desktop session, 30 "layer created" lines and zero pDestroyWindow. The
+ * driver callback is wired (driver_ios.c) and simply never invoked, because a
+ * guest PROCESS dying has its windows reaped server-side, in a process that no
+ * longer exists to notify the compositor that lives in the app.
+ *
+ * That is what leaves a closed program's window on screen as a black rectangle:
+ * the layer survives holding `bits`, a pointer into the dead process's memory,
+ * which is unmapped afterwards and reads as zeroes.
+ *
+ * So this does not wait to be told. The caller passes the set of window handles
+ * that currently exist -- it has just enumerated them on a Wine thread -- and
+ * every layer outside that set names a window that is gone. Garbage collection
+ * rather than notification, because notification is the thing that cannot
+ * arrive from a dead process.
+ */
+void winios_reap_orphan_layers(const void **live, unsigned n) {
+    @autoreleasepool {
+        if (!g_layers) return;
+        NSMutableSet<NSNumber *> *keep = [NSMutableSet setWithCapacity:n];
+        for (unsigned i = 0; i < n; i++)
+            [keep addObject:@((uintptr_t)live[i])];
+
+        NSArray<NSNumber *> *keys = [g_layers allKeys];
+        unsigned reaped = 0;
+        for (NSNumber *k in keys) {
+            if ([keep containsObject:k]) continue;
+            winios_remove_layer((HWND)(uintptr_t)[k unsignedLongLongValue]);
+            reaped++;
+        }
+        if (reaped)
+            fprintf(stderr, "[winios] ml795 reaped %u orphan layer(s), %lu live, "
+                            "%lu remain\n",
+                    reaped, (unsigned long)n, (unsigned long)g_layers.count);
+        fflush(stderr);
+    }
 }
 
 static void winios_remove_layer(HWND hwnd) {

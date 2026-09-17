@@ -153,6 +153,106 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
     }
 }
 
+/* ml792: ask the session's windows to close, the way the title-bar X does.
+ *
+ * A guest that does not exit on its own -- explorer.exe holding the virtual
+ * desktop is the case that forced this -- leaves g_wine_running set forever, so
+ * nothing else can ever be launched. There was no way to stop it: the log of
+ * one such run has two "Wine exited with code" lines for three sessions, and
+ * the third never ends.
+ *
+ * Polite, not violent: the guest runs its own shutdown -- saves, WM_CLOSE
+ * handlers, DestroyWindow, exit -- and then leaves through wine_ios_exit and
+ * the longjmp, which is the path whose teardown is already proven: wineserver
+ * stop, fd cache, TEB list, pool reclaim.
+ *
+ * WM_CLOSE rather than WM_SYSCOMMAND/SC_CLOSE, which the first cut used
+ * because it is what win32u posts for a close box (defwnd.c:2767). Measured on
+ * device: it closed the taskbar and the desktop ignored it, twice. Wine's
+ * desktop window explains why -- explorer/desktop.c:799 handles SC_CLOSE with
+ * ExitWindows(), a whole-session shutdown that asks every running app for
+ * permission first, while WM_CLOSE at :808 is a plain PostQuitMessage(0).
+ *
+ * WM_CLOSE is also the more universal of the two for ordinary windows: the
+ * standard close path is SC_CLOSE -> DefWindowProc -> WM_CLOSE, so posting
+ * WM_CLOSE skips only a step almost nobody intercepts, and it avoids putting a
+ * session-wide shutdown broadcast in the way of stopping one program.
+ *
+ * It can fail to work, and that is deliberate: a program entitled to ignore a
+ * close request will ignore this one. The caller reports how many windows were
+ * asked rather than pretending the session is gone, because a stop that lies is
+ * worse than a stop that did not happen.
+ */
+unsigned winios_drv_request_quit(void)
+{
+    HWND list[128];
+    ULONG size = ARRAY_SIZE(list), i;
+    unsigned posted = 0, invisible = 0;
+    NTSTATUS status;
+
+    status = NtUserBuildHwndList( 0, 0, FALSE, TRUE, 0, ARRAY_SIZE(list), list, &size );
+    if (status)
+    {
+        dprintf( 2, "[winios-quit] ml792 BuildHwndList failed 0x%x -- nothing asked\n",
+                 (unsigned)status );
+        return 0;
+    }
+
+    for (i = 0; i + 1 < size && i < ARRAY_SIZE(list); i++)
+    {
+        HWND hwnd = list[i];
+        DWORD style = get_window_long( hwnd, GWL_STYLE );
+
+        /* Invisible windows are message sinks, IME stubs and the 1x1 helpers the
+         * tree dump shows four of; closing them asks nothing of anybody. */
+        if (!(style & WS_VISIBLE)) { invisible++; continue; }
+
+        NtUserPostMessage( hwnd, WM_CLOSE, 0, 0 );
+        posted++;
+        dprintf( 2, "[winios-quit] ml792 WM_CLOSE -> %p (style=%08x)\n",
+                 hwnd, (unsigned)style );
+    }
+
+    /* ml795: the desktop window is not in that list -- BuildHwndList returns the
+     * desktop's CHILDREN, and Wine's explorer holds the desktop itself. Without
+     * this, stopping the desktop closed everything running on it and left
+     * explorer alive with an empty screen, which is not a stop. Its WndProc
+     * turns WM_CLOSE into PostQuitMessage(0) (explorer/desktop.c:808). */
+    {
+        HWND desktop = NtUserGetDesktopWindow();
+        if (desktop)
+        {
+            NtUserPostMessage( desktop, WM_CLOSE, 0, 0 );
+            posted++;
+            dprintf( 2, "[winios-quit] ml795 WM_CLOSE -> %p (the desktop itself)\n",
+                     desktop );
+        }
+    }
+
+    dprintf( 2, "[winios-quit] ml792 asked %u window(s) to close "
+                "(%u invisible skipped, of %u listed)\n",
+             posted, invisible, (unsigned)(size ? size - 1 : 0) );
+    return posted;
+}
+
+/* ml795: hand the compositor the set of windows that still exist, so it can
+ * drop the layers of the ones that do not. Runs here because the enumeration
+ * needs a Wine thread's TEB; see winios_reap_orphan_layers for why this is a
+ * sweep rather than a notification. */
+void winios_drv_reap_layers(void)
+{
+    extern void winios_reap_orphan_layers( const void **live, unsigned n ) __attribute__((weak));
+    HWND list[128];
+    ULONG size = ARRAY_SIZE(list);
+
+    if (!winios_reap_orphan_layers) return;
+    if (NtUserBuildHwndList( 0, 0, FALSE, TRUE, 0, ARRAY_SIZE(list), list, &size )) return;
+    /* BuildHwndList terminates the array with the desktop, which owns no layer;
+     * passing it costs nothing and keeps the count honest. */
+    winios_reap_orphan_layers( (const void **)list,
+                               (unsigned)(size <= ARRAY_SIZE(list) ? size : ARRAY_SIZE(list)) );
+}
+
 /* [winios-tree] window-tree dump: every top-level window with class,
  * title, style and rects. Driven from the app side (Winios.m
  * ProcessEvents drain) every few seconds in desktop mode — ground truth

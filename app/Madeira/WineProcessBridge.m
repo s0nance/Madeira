@@ -1405,8 +1405,25 @@ static int madeira_pin_wine_stack(pthread_attr_t *attr)
 
 int wine_process_start(const char *prefix_path) {
     if (g_wine_running) {
+        /* ml793: say no out loud, and say no with a code.
+         *
+         * This returned 0 -- success -- on a LOG() that goes to os_log and
+         * never to madeira-log.txt. So launching a program while one was still
+         * running did nothing at all, silently, and the UI reported "Wine
+         * process thread launched". That is how a whole evening went into
+         * "I try to relaunch fpconf after Doom and nothing changes": there was
+         * nothing to find in the log, because the refusal was invisible and
+         * dressed as a success.
+         *
+         * Same mistake as the madeira-pool.txt clamp that dropped an
+         * out-of-range value without a word. A gate that refuses in silence
+         * costs more than whatever it was guarding. */
         LOG("Wine process already running");
-        return 0;
+        dprintf(STDERR_FILENO,
+                "[WineProc] ml793 REFUSED: a Wine process is still running in this "
+                "app launch. Stop it first -- a program that never exits (the Wine "
+                "desktop is one) holds this until it is asked to close.\n");
+        return -2;
     }
 
     if (g_prefix_path) free(g_prefix_path);
@@ -1459,6 +1476,36 @@ int wine_process_start(const char *prefix_path) {
     pthread_detach(g_wine_thread);
     LOG("Wine process thread created");
     return 0;
+}
+
+/* ml793: ask the running session to stop.
+ *
+ * Returns the number of windows asked to close, 0 if nothing is running, and
+ * -1 if the request could not be delivered at all. Deliberately not a boolean
+ * "stopped": the close is a request the guest is entitled to refuse, the reply
+ * arrives asynchronously on a Wine thread, and reporting success here would be
+ * a guess dressed as a fact.
+ */
+int wine_process_request_stop(void) {
+    extern void winios_request_quit_async(void) __attribute__((weak));
+
+    if (!g_wine_running) {
+        dprintf(STDERR_FILENO, "[WineProc] ml793 stop requested, but no Wine process "
+                               "is running\n");
+        return 0;
+    }
+    if (!winios_request_quit_async) {
+        /* The display driver is what carries the request, and it is only linked
+         * in when the winios path is built. Better to say so than to look like
+         * a stop that did nothing. */
+        dprintf(STDERR_FILENO, "[WineProc] ml793 stop requested, but the winios quit "
+                               "path is not linked in -- cannot deliver it\n");
+        return -1;
+    }
+
+    dprintf(STDERR_FILENO, "[WineProc] ml793 asking the running session to close\n");
+    winios_request_quit_async();
+    return 1;
 }
 
 int wine_process_is_running(void) {

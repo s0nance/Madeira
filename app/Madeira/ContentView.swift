@@ -78,6 +78,61 @@ final class MetalHostView: UIView {
     required init?(coder: NSCoder) { fatalError() }
 }
 
+/// ml794: the one control that stays reachable while a guest owns the screen.
+///
+/// MetalHostView sits at window level, above the whole SwiftUI hierarchy, so
+/// once the Wine desktop is up the app's own interface is invisible underneath
+/// it. Touches are not the problem -- the host sets
+/// `isUserInteractionEnabled = false` so they fall through -- but you cannot
+/// tap a button you cannot see, and the desktop never exits by itself. That
+/// combination is what made a running session feel unstoppable.
+///
+/// A subview of the host would not work: with interaction disabled on the
+/// parent, UIKit's hit test rejects the whole subtree. So this is a SIBLING,
+/// added to the window after the host and kept in front of it, which is what
+/// puts it above the Metal layer while still receiving touches.
+///
+/// Deliberately small and dim. It is over someone's game.
+final class SessionControlView: UIView {
+    static let shared = SessionControlView(frame: CGRect(x: 0, y: 0, width: 96, height: 36))
+
+    private let button = UIButton(type: .system)
+    /// Set by ContentView so the button can reach the stop path without this
+    /// view knowing anything about Wine.
+    var onStop: (() -> Void)?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = true
+        backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        layer.cornerRadius = 18
+        layer.borderWidth = 0.5
+        layer.borderColor = UIColor.white.withAlphaComponent(0.25).cgColor
+
+        button.setTitle("Stop", for: .normal)
+        button.setImage(UIImage(systemName: "stop.circle"), for: .normal)
+        button.tintColor = .white
+        button.setTitleColor(.white, for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+        button.frame = bounds
+        button.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        button.addTarget(self, action: #selector(tapped), for: .touchUpInside)
+        addSubview(button)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func tapped() { onStop?() }
+
+    /// Park it under the top safe-area inset, on the right, where a full-screen
+    /// guest is least likely to have anything the user is reading.
+    func reposition(in window: UIWindow) {
+        let inset = window.safeAreaInsets.top
+        frame = CGRect(x: window.bounds.width - 96 - 12,
+                       y: max(inset, 8) + 4,
+                       width: 96, height: 36)
+    }
+}
+
 // SwiftUI-hosted placeholder: geometry + touch input only.
 final class MetalBackedView: UIView {
     private static var layerRegistered = false
@@ -151,6 +206,11 @@ final class MetalBackedView: UIView {
             host.removeFromSuperview()
             w.addSubview(host)
         }
+        // ml794: the stop control rides with the host, always in front of it.
+        let ctrl = SessionControlView.shared
+        if ctrl.superview !== w { ctrl.removeFromSuperview(); w.addSubview(ctrl) }
+        w.bringSubviewToFront(ctrl)
+        ctrl.reposition(in: w)
         host.frame = convert(gameRect(), to: w)
         // S2 desktop mode: the winios compositor renders the wine virtual
         // desktop aspect-fit inside THIS placeholder's area, exactly like
@@ -168,6 +228,11 @@ final class MetalBackedView: UIView {
         super.layoutSubviews()
         if let w = window {
             MetalHostView.shared.frame = convert(gameRect(), to: w)
+            // ml794: a layout pass can restack the window's subviews, so the
+            // control's position in front of the host is re-asserted, not
+            // assumed.
+            let ctrl = SessionControlView.shared
+            if ctrl.superview === w { w.bringSubviewToFront(ctrl); ctrl.reposition(in: w) }
             let full = convert(bounds, to: w)
             winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         }
@@ -849,6 +914,7 @@ struct ContentView: View {
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
     @State private var debuggerAttached = isDebuggerAttached()
+    @State private var wineRunning = false   // ml793: drives the Stop button
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
     /// Generic launcher sheet. Replaces the need for one hardcoded Button per
@@ -913,6 +979,9 @@ struct ContentView: View {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
+                // ml794: the window-level control knows nothing about Wine; it
+                // is handed the one thing it should be able to do.
+                SessionControlView.shared.onStop = { stopRunningSession() }
             }
             .sheet(isPresented: $showLauncher) {
                 LauncherView { spec in runLaunchSpec(spec) }
@@ -1159,6 +1228,7 @@ struct ContentView: View {
         .padding(.vertical, 2)
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
             debuggerAttached = isDebuggerAttached()
+            wineRunning = wine_process_is_running() != 0
         }
     }
 
@@ -1270,6 +1340,18 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .tint(.indigo)
             .disabled(!canLaunch)
+
+            // ml793: visible whenever something is running, because the launch
+            // button refusing is only useful if the way out is next to it.
+            if wineRunning {
+                Button {
+                    stopRunningSession()
+                } label: {
+                    Label("Stop", systemImage: "stop.circle")
+                }
+                .buttonStyle(.bordered)
+                .tint(.red)
+            }
 
             Spacer(minLength: 0)
 
@@ -1665,6 +1747,24 @@ struct ContentView: View {
 
         }
         .disabled(!canLaunch)
+    }
+
+    /// ml793/ml794: ask whatever is running to close itself.
+    ///
+    /// Reports what was actually asked, never "stopped" -- the close is a
+    /// request a guest may decline, and the answer comes back later on a Wine
+    /// thread. Saying "stopped" here would be the same silent lie as the
+    /// launch path returning success when it had refused.
+    private func stopRunningSession() {
+        let asked = wine_process_request_stop()
+        if asked == 0 {
+            logStore.log("Nothing is running.", level: .info)
+        } else if asked < 0 {
+            logStore.log("Could not deliver the stop request.", level: .error)
+        } else {
+            logStore.log("Asked the running session to close.", level: .success)
+            logStore.log("  A program may decline; watch the log for its exit.", level: .info)
+        }
     }
 
     private func runTriangleTest() {
@@ -2628,6 +2728,12 @@ struct ContentView: View {
         let result = wine_process_start(winePrefixPath)
         if result == 0 {
             logStore.log("Wine process thread launched", level: .success)
+        } else if result == -2 {
+            // ml793: the one refusal worth spelling out, because the program
+            // that causes it is the Wine desktop and it never exits on its own.
+            logStore.log("A Wine process is still running in this app launch.", level: .error)
+            logStore.log("  Use Stop to ask it to close, then launch again.", level: .error)
+            logStore.log("  The Wine desktop never exits by itself.", level: .error)
         } else {
             logStore.log("Failed to start Wine process (error: \(result))", level: .error)
         }

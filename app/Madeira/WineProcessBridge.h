@@ -27,3 +27,7 @@ int madeira_write_continue_flag(void);
  * Callable at any point so the pool's page-per-entry split can be dated:
  * present at allocation, or accumulated during the session. */
 void madeira_low_va_census(const char *when, void *rx, void *rw, size_t size);
+
+/* ml793: ask the running session to close itself. See the implementation for
+ * what the return value does and does not promise. */
+int wine_process_request_stop(void);
