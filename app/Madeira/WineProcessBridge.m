@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <string.h>
 #include <sys/mman.h>   /* mmap/mprotect: see madeira_pin_wine_stack */
+#include <mach/mach.h>   /* task_info(TASK_VM_INFO): see madeira_reclaim_jit_pool */
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -457,6 +458,84 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
         /* ml581: see madeira_undo_appdata_skeleton() above. */
         madeira_undo_appdata_skeleton( prefix );
     }
+}
+
+/* ---- ml760: hand the JIT pool's pages back once the guest is done -------
+ *
+ * Measured after a clean fpconf-x64.exe exit, with the guest gone and
+ * wineserver stopped:
+ *
+ *   [phys-map] bands  poolRX=384/384  poolRW=384/384  total_dirty=833 MB
+ *
+ * 768 of those 833 MB are the pool, counted on both aliases because RX (from
+ * the debugger) and RW (vm_remap'd onto the same pages) are two views of one
+ * object. Nothing ever releases them: the program exits, the server stops,
+ * and the pool stays fully dirty for as long as the app lives. On a phone
+ * with a jetsam limit that is most of the budget, held for code that will
+ * never run again.
+ *
+ * MADV_FREE_REUSABLE is the Darwin call that actually moves phys_footprint;
+ * MADV_FREE and MADV_DONTNEED do not, on a mapping like this one.
+ *
+ * Measured on device (A19, iOS 27), one call, both aliases attempted:
+ *
+ *   rw=0x139400000 ret=0  errno=0   <- granted
+ *   rx=0x121400000 ret=-1 errno=1   <- EPERM, and it does not matter
+ *   footprint 475 -> 68 MB
+ *
+ * The RX alias is refused because those pages came from the debugger and TXM
+ * owns their permissions; asking to reclaim them is not ours to ask. It costs
+ * nothing, because RX and RW are two views of ONE object: the next poll
+ * reports poolRX=0/384 poolRW=0/384, so the single RW call cleared the dirty
+ * count on both. The RX attempt stays anyway -- the printed EPERM is how the
+ * next reader learns this without re-deriving it.
+ *
+ * Both return codes and the footprint on either side are logged on purpose.
+ * A refusal that names itself is worth more than a silent no-op.
+ *
+ * Safe because a Wine session runs once per app launch -- the guard in
+ * runWineFullSequence refuses a second -- so no thread can execute from the
+ * pool again. REUSABLE pages return zero-filled, which is also what a future
+ * pool reuse wants: re-JITting starts from nothing either way.
+ */
+static unsigned long long madeira_footprint_mb(void)
+{
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) != KERN_SUCCESS)
+        return 0;
+    return (unsigned long long)vmi.phys_footprint >> 20;
+}
+
+static void madeira_reclaim_jit_pool(void)
+{
+    extern void *ios_jit_rx_base_global;
+    extern void *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+
+    void *rx = ios_jit_rx_base_global;
+    void *rw = ios_jit_rw_base_global;
+    size_t sz = ios_jit_pool_size_global;
+    unsigned long long before, after;
+    int r_rw = 0, e_rw = 0, r_rx = 0, e_rx = 0;
+
+    if (!sz || (!rx && !rw))
+    {
+        dprintf(STDERR_FILENO,
+                "[pool-reclaim] ml760 nothing to reclaim (rx=%p rw=%p size=%zu)\n",
+                rx, rw, sz);
+        return;
+    }
+
+    before = madeira_footprint_mb();
+    if (rw && (r_rw = madvise(rw, sz, MADV_FREE_REUSABLE)) != 0) e_rw = errno;
+    if (rx && (r_rx = madvise(rx, sz, MADV_FREE_REUSABLE)) != 0) e_rx = errno;
+    after = madeira_footprint_mb();
+
+    dprintf(STDERR_FILENO,
+            "[pool-reclaim] ml760 %zu MB pool | rw=%p ret=%d errno=%d | rx=%p ret=%d errno=%d "
+            "| footprint %llu -> %llu MB\n",
+            sz >> 20, rw, r_rw, e_rw, rx, r_rx, e_rx, before, after);
 }
 
 static void *wine_process_thread(void *arg) {
@@ -1042,6 +1121,10 @@ static void *wine_process_thread(void *arg) {
         wineserver_stop();
 
         dprintf(STDERR_FILENO, "[WineProc] Wine process thread finished cleanly\n");
+
+        /* ml760: the guest is gone and the server is stopped, so the 384 MB
+         * pool is dead weight from here on. See madeira_reclaim_jit_pool. */
+        madeira_reclaim_jit_pool();
 
         // Steam S0: this thread's TEB was mirrored into pthread TSD slot
         // 275 (FEX's hardcoded 0x898) which we don't own via
