@@ -699,9 +699,33 @@ static void madeira_reclaim_jit_pool(void)
      * are still live. Reclaim or reuse, never both. */
     if (getenv("MADEIRA_REUSE"))
     {
+        /* ml798: standing down on the whole pool does not mean standing down on
+         * all of it. The allocated part must survive -- its module copies are
+         * still referenced by tables that outlive the session -- but the pool
+         * grows from both ends and the middle has never been handed to anyone,
+         * so nothing can be pointing into it. That part is free to give back
+         * even while reuse is armed. */
+        extern void ios_jit_pool_free_span( size_t *off, size_t *len );
+        size_t off = 0, len = 0;
+        unsigned long long b, a;
+        int r;
+
+        ios_jit_pool_free_span( &off, &len );
+        if (!len || !rw)
+        {
+            dprintf(STDERR_FILENO,
+                    "[pool-reclaim] ml798 MADEIRA_REUSE is set and the pool has no "
+                    "unallocated span to give back (off=%zu len=%zu)\n", off, len);
+            return;
+        }
+
+        b = madeira_footprint_mb();
+        r = madvise((char *)rw + off, len, MADV_FREE_REUSABLE);
+        a = madeira_footprint_mb();
         dprintf(STDERR_FILENO,
-                "[pool-reclaim] ml763 standing down: MADEIRA_REUSE is set, the pool "
-                "must outlive this session\n");
+                "[pool-reclaim] ml798 reuse armed: kept the allocated %zu MB, gave back "
+                "the unallocated %zu MB at +0x%zx (ret=%d errno=%d) | footprint %llu -> %llu MB\n",
+                (sz - len) >> 20, len >> 20, off, r, r ? errno : 0, b, a);
         return;
     }
 

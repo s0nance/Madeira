@@ -172,6 +172,7 @@ static int ios_jit_mapping_count = 0;
  * collision risk. */
 static size_t jit_pool_offset = 0;
 
+
 /* ---- Pool reclamation (task #25) ----------------------------------------
  * The bump allocator never freed anything: 8 pseudo-processes consumed
  * 368.9/384MB (2026-07-07) and the 9th BUS-loop-locked the session. Every
@@ -2324,7 +2325,37 @@ void ios_pool_va_warn( const char *who, const void *addr, size_t size )
 void *ios_jit_rx_base_global = NULL;
 void *ios_jit_rw_base_global = NULL;
 size_t ios_jit_pool_size_global = 0;
-unsigned long long ios_last_footprint_mb = 0;   /* ml668: latest phys_footprint MB (decl above) */
+unsigned long long ios_last_footprint_mb = 0;
+
+/* ml798: the part of the pool that has never been handed to anybody.
+ *
+ * Reclaiming the pool at session end (ml760) stands down while reuse is armed,
+ * because MADV_FREE_REUSABLE returns zero-filled pages and the module copies
+ * already in the pool are still referenced by tables that survive the session.
+ * That is correct for the ALLOCATED part and says nothing about the rest: the
+ * pool grows from the bottom (jit_pool_offset) and from the top
+ * (ios_jit_tail_reserved), and the middle has never been given to anyone. No
+ * table can point into it, so zeroing it cannot invalidate anything.
+ *
+ * Both bounds only grow, so a snapshot is a lower bound on what is free -- the
+ * worst a race costs is reclaiming slightly less than we could have.
+ */
+void ios_jit_pool_free_span( size_t *off, size_t *len )
+{
+    size_t total = ios_jit_pool_size_global;
+    size_t head = jit_pool_offset;
+    size_t tail = ios_jit_tail_reserved;
+
+    *off = *len = 0;
+    if (!total || head + tail >= total) return;
+    /* Page-align inward so the span never overlaps a used page. */
+    head = (head + 0x3fff) & ~(size_t)0x3fff;
+    tail = (tail + 0x3fff) & ~(size_t)0x3fff;
+    if (head + tail >= total) return;
+    *off = head;
+    *len = total - tail - head;
+}
+   /* ml668: latest phys_footprint MB (decl above) */
 int ios_fast_footprint = 0;                    /* ml670: set when d3d11 loads */
 /* ml791: when it was armed, so it can stop being armed.
  *

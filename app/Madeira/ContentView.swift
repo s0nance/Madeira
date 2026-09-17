@@ -125,11 +125,57 @@ final class SessionControlView: UIView {
 
     /// Park it under the top safe-area inset, on the right, where a full-screen
     /// guest is least likely to have anything the user is reading.
+    ///
+    /// ml799: this is the ONLY Stop, and it does not try to work out whether it
+    /// is needed.
+    ///
+    /// There were briefly two -- this one and a SwiftUI button in the action row
+    /// -- so ml797 tried to hide this one whenever the other was reachable, by
+    /// asking whether the Metal host's frame covered the window. That measured
+    /// the wrong rectangle: the host's frame is gameRect() inside the
+    /// placeholder, while what actually covers the screen is the compositor
+    /// frame, set from the placeholder's full bounds. In desktop mode the test
+    /// said "not covered", this hid, the SwiftUI row was underneath the desktop
+    /// and invisible, and there was no way to stop anything at all -- the window
+    /// had to be closed by its own title-bar X.
+    ///
+    /// So the SwiftUI button is gone and this one shows whenever a session is
+    /// running. Visibility is set by the caller from that one fact rather than
+    /// inferred from geometry here. One button that is always reachable beats
+    /// two that are sometimes both hidden, and a control whose whole purpose is
+    /// to be the way out must not be clever about when to exist.
     func reposition(in window: UIWindow) {
         let inset = window.safeAreaInsets.top
         frame = CGRect(x: window.bounds.width - 96 - 12,
                        y: max(inset, 8) + 4,
                        width: 96, height: 36)
+    }
+
+    /// ml800: attach, front and place itself, without waiting to be laid out.
+    ///
+    /// The previous cut did all three from MetalBackedView -- its window attach
+    /// and its layoutSubviews. Both stop being called once a guest owns the
+    /// screen: SwiftUI has no reason to lay out a placeholder nothing is
+    /// looking at, and runWineFullSequence sets logStore.uiPaused precisely to
+    /// stop re-renders while Wine runs. So the one control that exists for that
+    /// situation depended on work that situation suppresses, and it stayed
+    /// wherever it was -- or was never added at all.
+    ///
+    /// Driven from the poll timer instead, which fires on its own schedule and
+    /// owes nothing to the view hierarchy. Idempotent: attaching an already
+    /// attached view and fronting an already fronted one both cost nothing.
+    func present(running: Bool) {
+        guard let w = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .flatMap({ $0.windows })
+                .first(where: { $0.isKeyWindow }) ?? UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene }).flatMap({ $0.windows }).first
+        else { return }
+
+        if superview !== w { removeFromSuperview(); w.addSubview(self) }
+        w.bringSubviewToFront(self)
+        reposition(in: w)
+        isHidden = !running
     }
 }
 
@@ -232,7 +278,10 @@ final class MetalBackedView: UIView {
             // control's position in front of the host is re-asserted, not
             // assumed.
             let ctrl = SessionControlView.shared
-            if ctrl.superview === w { w.bringSubviewToFront(ctrl); ctrl.reposition(in: w) }
+            if ctrl.superview === w {
+                w.bringSubviewToFront(ctrl)
+                ctrl.reposition(in: w)
+            }
             let full = convert(bounds, to: w)
             winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         }
@@ -1229,6 +1278,10 @@ struct ContentView: View {
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
             debuggerAttached = isDebuggerAttached()
             wineRunning = wine_process_is_running() != 0
+            // ml799/ml800: shown while a session runs, hidden otherwise -- and
+            // attached and placed from here, because the view hierarchy stops
+            // laying out exactly when this is needed.
+            SessionControlView.shared.present(running: wineRunning)
         }
     }
 
@@ -1340,18 +1393,6 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .tint(.indigo)
             .disabled(!canLaunch)
-
-            // ml793: visible whenever something is running, because the launch
-            // button refusing is only useful if the way out is next to it.
-            if wineRunning {
-                Button {
-                    stopRunningSession()
-                } label: {
-                    Label("Stop", systemImage: "stop.circle")
-                }
-                .buttonStyle(.bordered)
-                .tint(.red)
-            }
 
             Spacer(minLength: 0)
 

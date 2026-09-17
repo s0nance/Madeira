@@ -198,40 +198,76 @@ unsigned winios_drv_request_quit(void)
         return 0;
     }
 
+    /* ml796: close what is RUNNING ON the desktop before closing the desktop.
+     *
+     * The first cut posted to every visible window and to the desktop in one
+     * go, so stopping a game also took the taskbar, the Start menu and the
+     * whole environment with it -- and the Start-menu shortcut we had just
+     * added became useless, because quitting a game removed the menu you would
+     * relaunch it from.
+     *
+     * So: anything owned by a process other than the desktop's owner is a guest
+     * running ON the desktop, and only those are asked first. The desktop goes
+     * only once nothing is left on it, which makes a second press end the
+     * session. For a plain session with no explorer, every window belongs to
+     * the same process as the desktop, guests is 0, and the first press ends it
+     * -- which is what Stop should mean when there is no environment to keep.
+     */
+    HWND desktop = NtUserGetDesktopWindow();
+    DWORD desk_pid = 0, guests = 0;
+
+    if (desktop) get_window_thread( desktop, &desk_pid );
+
     for (i = 0; i + 1 < size && i < ARRAY_SIZE(list); i++)
     {
         HWND hwnd = list[i];
-        DWORD style = get_window_long( hwnd, GWL_STYLE );
+        DWORD style = get_window_long( hwnd, GWL_STYLE ), pid = 0;
 
         /* Invisible windows are message sinks, IME stubs and the 1x1 helpers the
          * tree dump shows four of; closing them asks nothing of anybody. */
         if (!(style & WS_VISIBLE)) { invisible++; continue; }
 
+        get_window_thread( hwnd, &pid );
+        if (!desk_pid || pid == desk_pid) continue;   /* the desktop's own furniture */
+
         NtUserPostMessage( hwnd, WM_CLOSE, 0, 0 );
-        posted++;
-        dprintf( 2, "[winios-quit] ml792 WM_CLOSE -> %p (style=%08x)\n",
-                 hwnd, (unsigned)style );
+        posted++; guests++;
+        dprintf( 2, "[winios-quit] ml796 WM_CLOSE -> %p (guest, pid=%04x, style=%08x)\n",
+                 hwnd, (unsigned)pid, (unsigned)style );
     }
 
-    /* ml795: the desktop window is not in that list -- BuildHwndList returns the
-     * desktop's CHILDREN, and Wine's explorer holds the desktop itself. Without
-     * this, stopping the desktop closed everything running on it and left
-     * explorer alive with an empty screen, which is not a stop. Its WndProc
-     * turns WM_CLOSE into PostQuitMessage(0) (explorer/desktop.c:808). */
+    if (!guests)
     {
-        HWND desktop = NtUserGetDesktopWindow();
+        /* Nothing is running on it, so the environment itself is what Stop
+         * means now. The desktop window is not in the list above --
+         * BuildHwndList returns the desktop's CHILDREN -- so it is posted to
+         * separately; its WndProc turns WM_CLOSE into PostQuitMessage(0)
+         * (explorer/desktop.c:808). */
+        for (i = 0; i + 1 < size && i < ARRAY_SIZE(list); i++)
+        {
+            HWND hwnd = list[i];
+            DWORD style = get_window_long( hwnd, GWL_STYLE );
+
+            if (!(style & WS_VISIBLE)) continue;
+            NtUserPostMessage( hwnd, WM_CLOSE, 0, 0 );
+            posted++;
+            dprintf( 2, "[winios-quit] ml796 WM_CLOSE -> %p (style=%08x)\n",
+                     hwnd, (unsigned)style );
+        }
         if (desktop)
         {
             NtUserPostMessage( desktop, WM_CLOSE, 0, 0 );
             posted++;
-            dprintf( 2, "[winios-quit] ml795 WM_CLOSE -> %p (the desktop itself)\n",
+            dprintf( 2, "[winios-quit] ml796 WM_CLOSE -> %p (the desktop itself)\n",
                      desktop );
         }
     }
 
-    dprintf( 2, "[winios-quit] ml792 asked %u window(s) to close "
+    dprintf( 2, "[winios-quit] ml796 asked %u window(s) to close -- %s "
                 "(%u invisible skipped, of %u listed)\n",
-             posted, invisible, (unsigned)(size ? size - 1 : 0) );
+             posted,
+             guests ? "guests only, the desktop stays" : "nothing was running on it, so it goes too",
+             invisible, (unsigned)(size ? size - 1 : 0) );
     return posted;
 }
 
