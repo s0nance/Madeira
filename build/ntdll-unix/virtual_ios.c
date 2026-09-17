@@ -12080,6 +12080,48 @@ void virtual_init(void)
 #else
     size = 2 * view_block_size + (1U << (32 - page_shift));
 #endif
+#ifdef WINE_IOS
+    /* ml780: the view bookkeeping is built once per PROCESS, not once per
+     * session.
+     *
+     * A second Wine session re-entered virtual_init and rebuilt all of it:
+     * a fresh heap, an empty views_tree, and free_ranges reset to the single
+     * entry [0, ~0) -- "the entire address space is free". Meanwhile the
+     * kernel still held every mapping the first session made. Reality and
+     * bookkeeping then disagreed about the whole address space, and the
+     * loader's placement scan, which derives its candidates from free_ranges,
+     * produced candidates that were all already taken:
+     *
+     *   [va-scan] window=0x1005f0000..0x73ffff0000 size=0x23000
+     *             tries=119 skips=119 views=1 stop=walked-all-views
+     *             OCCUPIED 0x1005e4000+0xbfc000 prot=5/5
+     *
+     * tries=119 skips=119 -- every candidate skipped, mmap never called once.
+     * It did not fail to find room, it never looked anywhere real.
+     *
+     * Keeping the tree, free_ranges and pages_vprot is the truthful option:
+     * they describe mappings that ARE still there, so session two sees its
+     * predecessor's modules as occupied and places its own elsewhere, which is
+     * what it would do for any other tenant. The alternative -- releasing the
+     * first session's mappings so a fresh list is true -- is a far larger
+     * change and only necessary if keeping them turns out to be wrong.
+     *
+     * Not keyed on view_block_start: alloc_view bumps that pointer
+     * (view_block_start++), so it is an allocation cursor and not a record of
+     * whether we have initialised. A dedicated flag cannot be confused with
+     * it. */
+    static int ios_views_inited;
+
+    if (ios_views_inited)
+    {
+        dprintf( 2, "[views] ml780 keeping the previous session's view bookkeeping "
+                    "(tree, free_ranges, pages_vprot); cursor=%p end=%p\n",
+                 view_block_start, view_block_end );
+    }
+    else
+    {
+    ios_views_inited = 1;
+#endif
     view_block_start = alloc_virtual_heap( size );
     assert( view_block_start != MAP_FAILED );
     view_block_end = view_block_start + view_block_size / sizeof(*view_block_start);
@@ -12090,6 +12132,9 @@ void virtual_init(void)
     free_ranges[0].base = (void *)0;
     free_ranges[0].end = (void *)~0;
     free_ranges_end = free_ranges + 1;
+#ifdef WINE_IOS
+    }
+#endif
 
     /* make the DOS area accessible (except the low 64K) to hide bugs in broken apps like Excel 2003 */
     size = (char *)address_space_start - (char *)0x10000;
@@ -12098,7 +12143,11 @@ void virtual_init(void)
 
     /* ml433 (#72): hold back the only 8GB-aligned stretch in the guest band
      * before top-down placement can put furniture in it — see IOS_CAGE_BASE. */
-    if (anon_mmap_fixed( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE, PROT_NONE, 0 ) != MAP_FAILED)
+    /* ml780: already held from the first session -- re-reserving its own
+     * holdback only produces a misleading "FAILED" line. */
+    if (ios_cage_holdback_live)
+        dprintf( 2, "[cage] holdback still held from the previous session rev=ml433\n" );
+    else if (anon_mmap_fixed( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE, PROT_NONE, 0 ) != MAP_FAILED)
     {
         ios_cage_holdback_live = 1;
         dprintf( 2, "[cage] holdback reserved 0x%llx+0x%llx rev=ml433\n",
