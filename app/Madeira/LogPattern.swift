@@ -14,6 +14,26 @@ struct LogPattern {
     static func canonicalize(_ raw: String) -> (signature: String, level: LogStore.LogEntry.Level) {
         var s = raw
 
+        /* Periodic gauges collapse to their TAG ALONE.
+         *
+         * These probes tick several times a second and every tick carries a
+         * different reading -- cycle=274, age=76s, parked=5, pos=9305. The
+         * generic rules below only blank integers of three digits or more (the
+         * threshold exists to preserve meaningful small values like
+         * MaxInst=0), so one- and two-digit counters kept each tick distinct.
+         * Every tick therefore became a NEW entry, jumped to the top of a list
+         * sorted by last-seen, and pushed everything else down -- hundreds of
+         * times a minute. The console was unreadable while a program ran.
+         *
+         * A gauge wants one row showing its latest reading, which is exactly
+         * what the existing ×N collapsing gives once the signature stops
+         * varying. Matched on the bracketed tag rather than by listing every
+         * counter name, because the counters change whenever a probe is
+         * revised and the tag does not. */
+        for tag in Self.periodicTags where s.hasPrefix(tag) {
+            return (tag, inferLevel(from: s))
+        }
+
         // Strip leading `[HH:MM:SS.mmm]` timestamp prefix from wine_log_write
         if let r = s.range(of: #"^\[\d{2}:\d{2}:\d{2}\.\d{3}\]\s*"#, options: .regularExpression) {
             s.removeSubrange(r)
@@ -76,6 +96,14 @@ struct LogPattern {
 
         return (s, level)
     }
+
+    /// Probes that report a running measurement on a timer. Their value is
+    /// the LATEST reading, never the history, so they collapse to one row.
+    private static let periodicTags = [
+        "[footprint]", "[waiters]", "[alert-ring]", "[pool-rot]", "[phys-map]",
+        "[mem-census]", "[dyn-census]", "[buf-site]", "[live]", "[trim]",
+        "[thread-stacks]", "[commit-zero]",
+    ]
 
     /// Infer log level from raw line content.
     private static func inferLevel(from line: String) -> LogStore.LogEntry.Level {

@@ -44,6 +44,12 @@ struct FPSOverlay: View {
     /// Compact = landscape side-bar variant: FPS + pacing pill stacked
     /// vertically, no present counter (fits a ~120pt pillarbox bar).
     var compact: Bool = false
+    /// Embedded in a status strip rather than floating over the game: one
+    /// line, no background, no padding of its own. The compact variant is a
+    /// VStack on a black plate, which is right when it sits over a running
+    /// game in the landscape pillarbox and wrong inside a row of controls --
+    /// there it read as a dark blob on two lines.
+    var inline: Bool = false
     @State private var presentCount: UInt64 = 0
     @State private var fps: Double = 0
     @State private var visible: Bool = true
@@ -90,7 +96,17 @@ struct FPSOverlay: View {
 
     var body: some View {
         Group {
-            if visible && compact {
+            if visible && inline {
+                HStack(spacing: 6) {
+                    Text("\(memMB)MB").foregroundColor(memColor)
+                    Text(String(format: "%.1f", fps)) .foregroundColor(fpsColor)
+                    Text("fps").foregroundStyle(.secondary)
+                    pacingPill
+                }
+                .font(.system(.caption2, design: .monospaced))
+                .lineLimit(1)
+                .fixedSize()
+            } else if visible && compact {
                 VStack(spacing: 4) {
                     Text(String(format: "%.1f", fps))
                         .foregroundColor(fpsColor)
