@@ -1078,6 +1078,24 @@ void ios_pump_sample(void)
     }
 }
 
+/* ml758: the JIT-pool dump is opt-in. Left unconditional it cost 384 MiB of
+ * writes and ~360 MB of footprint on every launch, successful ones included —
+ * see the call sites. Documents/madeira-jit-dump.txt containing "1" sets
+ * MADEIRA_JIT_DUMP and turns it back on. */
+__attribute__((unused))
+static int ios_jit_dump_enabled(void)
+{
+    static volatile int cached = -1;
+    int v = cached;
+    if (v < 0)
+    {
+        const char *e = getenv("MADEIRA_JIT_DUMP");
+        v = (e && e[0] == '1' && e[1] == 0) ? 1 : 0;
+        cached = v;
+    }
+    return v;
+}
+
 /* Diagnostic: first .data fault captured by Mach handler */
 volatile uint64_t ios_exc_data_fault_pc = 0;
 volatile uint64_t ios_exc_data_fault_lr = 0;
@@ -4655,12 +4673,23 @@ skip_reclaim_band: ;
                             fp_walk = frame_buf[0];
                         }
                     }
-                    /* One-shot dump: on the first UNHANDLED exec fault, dump the
-                     * JIT-pool RW alias contents around the relevant FEX CodeBuffer
-                     * slots to a file. Lets us disassemble FEX-emitted ARM64 offline
-                     * to verify codegen correctness independently. */
+                    /* One-shot dump of the JIT-pool RW alias, so FEX-emitted
+                     * ARM64 can be disassembled offline and its codegen checked
+                     * independently.
+                     *
+                     * ml758: this fired on `cnt == 1`, and the first unhandled
+                     * exception is ALWAYS the `brk #0xf00d` that jit26_detach
+                     * raises to hand control back to StikDebug. That trap is
+                     * harmless by design and says nothing about codegen, so
+                     * every launch — the ones that succeeded included — wrote
+                     * 384 MiB into Documents and paged in the whole RW alias
+                     * (measured: footprint 482 -> 845 MB), and the one-shot was
+                     * already spent by the time a real fault arrived. It now
+                     * skips breakpoints and waits for an actual fault, and only
+                     * runs when asked for. */
                     static volatile int dumped = 0;
-                    if (cnt == 1 && __sync_bool_compare_and_swap(&dumped, 0, 1))
+                    if (ios_jit_dump_enabled() && req->exception != EXC_BREAKPOINT &&
+                        __sync_bool_compare_and_swap(&dumped, 0, 1))
                     {
                         extern void *ios_jit_rw_base_global;
                         extern size_t ios_jit_pool_size_global;
@@ -4675,9 +4704,10 @@ skip_reclaim_band: ;
                             int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
                             if (fd >= 0)
                             {
-                                /* Dump the entire JIT pool RW alias. ~128MB but
-                                 * mostly zero. Compresses well; helpful to scan
-                                 * any populated region. */
+                                /* Dump the entire JIT pool RW alias: it is as
+                                 * large as the pool, so 384 MiB at the current
+                                 * default and not the 128 MB this comment used
+                                 * to claim. Mostly zero, so it compresses well. */
                                 ssize_t off = 0;
                                 size_t total = ios_jit_pool_size_global;
                                 while ((size_t)off < total)
@@ -8907,7 +8937,8 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * fire for ILL since we deliver via setup_exception). One-shot. */
         {
             static volatile int ill_dumped = 0;
-            if (__sync_bool_compare_and_swap(&ill_dumped, 0, 1)) {
+            if (ios_jit_dump_enabled() &&
+                __sync_bool_compare_and_swap(&ill_dumped, 0, 1)) {
                 extern void *ios_jit_rw_base_global;
                 extern size_t ios_jit_pool_size_global;
                 if (ios_jit_rw_base_global && ios_jit_pool_size_global) {

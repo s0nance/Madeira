@@ -2055,6 +2055,21 @@ struct ContentView: View {
                 logStore.log("W^X override: MADEIRA_WX=\(v) via madeira-wx.txt")
             }
 
+            // ml758: the JIT-pool dump. It writes the whole RW alias — 384 MiB
+            // at the current pool size — into Documents and makes every page of
+            // it resident, which showed up as footprint 482 -> 845 MB. Useful
+            // when we actually want to disassemble FEX output, waste on every
+            // other launch, so it is off unless Documents/madeira-jit-dump.txt
+            // says "1".
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-jit-dump.txt"), encoding: .utf8) {
+                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                setenv("MADEIRA_JIT_DUMP", v, 1)
+                logStore.log("JIT pool dump: MADEIRA_JIT_DUMP=\(v) via madeira-jit-dump.txt")
+            } else {
+                unsetenv("MADEIRA_JIT_DUMP")
+            }
+
             // ml727: wine-mono backpatcher bridge A/B. Documents/madeira-mono-bridge.txt
             // == "1" sets MADEIRA_WINEMONO_BRIDGE, which arms FEX's Mono code-patching
             // optimisation for wine-mono (recognised since ml712 but activation left
