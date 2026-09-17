@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <string.h>
+#include <sys/mman.h>   /* mmap/mprotect: see madeira_pin_wine_stack */
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -119,7 +120,8 @@ static int madeira_prune_keep_tree(const char *dir, int depth)
  * its own user.reg (Wine rewrote them after parsing). So repair on disk, before
  * __wine_main, once:
  *   1. rewrite  C:\\usersmadeira  ->  C:\\users\\madeira  in the three .reg files
- *   2. MOVE (never delete) drive_c/usersmadeira/* into drive_c/users/madeira/*
+ *   2. MOVE (never delete) everything under drive_c/usersmadeira into
+ *      drive_c/users/madeira
  *   3. ensure the AppData skeleton exists
  * Idempotent and marker-gated. Step 2 merges and refuses to clobber: if a
  * destination already exists the source is left in place for manual review,
@@ -1057,6 +1059,84 @@ static void *wine_process_thread(void *arg) {
     return NULL;
 }
 
+/* ---- ml759: the Wine thread's stack must outlive the Wine thread --------
+ *
+ * Four crashes out of four put the faulting address exactly 0x98c below this
+ * thread's pthread TSD base:
+ *
+ *   tsd_base=0x16db670e0  fault=0x16db66754   delta=0x98c
+ *   tsd_base=0x16df630e0  fault=0x16df62754   delta=0x98c
+ *   tsd_base=0x16f95b0e0  fault=0x16f95a754   delta=0x98c
+ *   tsd_base=0x16f7830e0  fault=0x16f782754   delta=0x98c
+ *
+ * The bases differ only by ASLR; the offset into the stack never moves. The
+ * sequence is always the same: AGXMetalG18P calls _platform_strcmp on a
+ * libdispatch worker with a pointer into THIS stack, well after the guest
+ * exited and pthread unmapped it, and the process dies on an unmapped hole.
+ * It is not the guest program -- fpconf passes 28/28 and heap 4/4, both exit
+ * 0 -- and it is not memory pressure, which was measured and ruled out.
+ *
+ * WHO hands Metal that pointer is still open. Two putenv() sites that keep
+ * the caller's memory instead of copying it are the standing suspects
+ * (loader_ios.c exec_wineloader, process_ios.c winedebug). But the lifetime
+ * is ours to fix independently: map the stack here and never unmap it. The
+ * stale read then returns stale bytes instead of faulting, which is the
+ * difference between a wrong string and a dead app.
+ *
+ * Deliberately never freed. A Wine session runs once per app launch (the
+ * guard in ContentView.runWineFullSequence refuses a second one), so exactly
+ * one of these exists for the life of the process -- and freeing it is
+ * precisely the bug.
+ */
+static void  *g_wine_stack_base = NULL;   /* what pthread gets, never unmapped */
+static size_t g_wine_stack_size = 0;
+
+static int madeira_pin_wine_stack(pthread_attr_t *attr)
+{
+    size_t page = (size_t)getpagesize();
+    size_t want = 0;
+    char *p;
+    int r;
+
+    if (g_wine_stack_base)
+        return pthread_attr_setstack(attr, g_wine_stack_base, g_wine_stack_size);
+
+    /* Keep the depth pthread would have given us. setstack hands ownership to
+     * the caller and pthread carves its own per-thread struct out of the top
+     * of the region, so add a page of headroom rather than silently shrinking
+     * the usable stack. */
+    if (pthread_attr_getstacksize(attr, &want) != 0 || want == 0)
+        want = 512 * 1024;
+    want = (want + page + page - 1) & ~(page - 1);
+
+    /* One guard page at the low end: with setstack, pthread installs none. */
+    p = mmap(NULL, want + page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED)
+    {
+        dprintf(STDERR_FILENO,
+                "[wine-stack] ml759 mmap failed errno=%d -- pthread keeps the stack, "
+                "the Metal use-after-free stays live\n", errno);
+        return -1;
+    }
+    if (mprotect(p, page, PROT_NONE) != 0)
+        dprintf(STDERR_FILENO, "[wine-stack] ml759 guard mprotect failed errno=%d\n", errno);
+
+    g_wine_stack_base = p + page;
+    g_wine_stack_size = want;
+
+    r = pthread_attr_setstack(attr, g_wine_stack_base, g_wine_stack_size);
+    /* The range is the point of this log line: when a fault lands in it, the
+     * diagnosis above is confirmed rather than inferred. */
+    dprintf(STDERR_FILENO,
+            "[wine-stack] ml759 pinned %zu KB at %p..%p (guard %p) setstack=%d\n",
+            want / 1024, g_wine_stack_base,
+            (void *)((char *)g_wine_stack_base + want), (void *)p, r);
+    if (r != 0)
+        dprintf(STDERR_FILENO,
+                "[wine-stack] ml759 setstack REFUSED (%d) -- pthread keeps the stack\n", r);
+    return r;
+}
+
 int wine_process_start(const char *prefix_path) {
     if (g_wine_running) {
         LOG("Wine process already running");
@@ -1095,6 +1175,10 @@ int wine_process_start(const char *prefix_path) {
     pthread_attr_init(&attr);
     struct sched_param sched = { .sched_priority = 20 };  // lower than default (31)
     pthread_attr_setschedparam(&attr, &sched);
+
+    /* ml759: give the thread a stack we own and never release. On failure we
+     * still start -- that is the behaviour we had before, crash included. */
+    madeira_pin_wine_stack(&attr);
 
     int ret = pthread_create(&g_wine_thread, &attr, wine_process_thread, NULL);
     pthread_attr_destroy(&attr);
